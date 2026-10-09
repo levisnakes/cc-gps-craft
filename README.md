@@ -11,7 +11,11 @@ On a Sable ship it watches how far the craft is leaning and holds it level.
 - **Vector thruster (best).** If a vector thruster is attached to the computer (touching it, or on a wired modem), it's found automatically. A few blocks off the ground it aims the nozzle each way to learn which way that tips the craft, then aims it every tick to keep the craft level. The side thrusters then only push it toward the target. The screen shows `Level: on (vector thruster)`.
 - **Side thrusters.** Without a vector thruster, side thrusters mounted above or below the center of mass hold it level instead, and it steers by leaning like a drone (`Level: on (side thrusters)`). If they're level with the center of mass they can't tip it (`Level: OFF`).
 
-Put the lift thruster as close to under the center of mass as you can, especially without a vector thruster. Without nozzle leveling, the lift cuts out past MAX_TILT (60°) instead of driving the craft into the ground. Side thrusters that would tip the craft further ease off as it leans and stop at SIDE_CUT_TILT (20°), until the craft is back under half that.
+Put the lift thruster as close to under the center of mass as you can, especially without a vector thruster. Without nozzle leveling, the lift cuts out past MAX_TILT (60°) instead of driving the craft into the ground. Side thrusters ease off as the craft leans and stop at SIDE_CUT_TILT (20°), until the craft is back under half that.
+
+## Flight log
+
+Every flight writes `craft.log` on the computer: the calibration results, then the height, lean, nozzle aim and every thruster output five times a second. To share it, run `pastebin put craft.log` and send the link it prints.
 
 ## Install
 
