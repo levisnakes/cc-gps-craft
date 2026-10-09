@@ -25,7 +25,7 @@ CRUISE_Y = 200          -- altitude to fly at
 -- Read these off the craft (goggles on the ship and the lift thruster).
 -- Hover power is worked out from them and fine-tuned in flight.
 CRAFT_WEIGHT_PN = 55    -- total weight of the craft
-LIFT_THRUST_PN = 66     -- lift thruster output at full power (redstone 15)
+LIFT_THRUST_PN = 133    -- lift thruster output at full power (redstone 15)
 MAX_CLIMB = 6           -- max climb/sink speed while changing altitude (blocks per second)
 ARRIVE_RADIUS = 3       -- blocks from target X/Z counted as "over the target"
 DESCENT_SPEED = 5       -- blocks per second while dropping onto the target
