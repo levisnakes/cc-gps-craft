@@ -102,8 +102,11 @@ local function clamp(v, lo, hi)
   return v
 end
 
+local nozzle = nil      -- vector thruster peripheral, if one is attached
+
 local function allOff()
   for _, side in ipairs(ALL_SIDES) do rs.setAnalogOutput(side, 0) end
+  if nozzle then pcall(nozzle.setVector, 0, 0) end
   if PAYLOAD_RELAY and peripheral.isPresent(PAYLOAD_RELAY) then
     for _, side in ipairs(ALL_SIDES) do
       pcall(peripheral.call, PAYLOAD_RELAY, "setAnalogOutput", side, 0)
@@ -232,6 +235,92 @@ local function gpsLoop()
   end
 end
 
+local function waitFix()
+  os.pullEvent("fix")
+  return pos
+end
+
+local function waitSeconds(s)
+  local untilT = now() + s
+  while now() < untilT do waitFix() end
+end
+
+-- ---------- vector thruster leveling ----------
+-- A vector thruster aims its nozzle up to 30 degrees two ways (setVector,
+-- -1..1 each). Calibration learns how each aim tips the craft; after that
+-- the nozzle holds the craft level every tick.
+
+local nozzleTip = nil   -- { x = , y = } tip per unit of aim, ship frame
+local nozzleTried = false
+local nozzleStrength = 0  -- weakest tip at full aim
+local nozzlePaused = false  -- centered while a side thruster is measured
+local nozzleI = { x = 0, z = 0 }
+local lastLevel = nil
+
+local function aimNozzle(ax, ay)
+  if nozzle then pcall(nozzle.setVector, clamp(ax, -1, 1), clamp(ay, -1, 1)) end
+end
+
+local function levelNozzle()
+  local t = now()
+  local dt = lastLevel and math.min(t - lastLevel, 0.5) or 0
+  lastLevel = t
+  local a, b = rotate(orient, nozzleTip.x), rotate(orient, nozzleTip.y)
+  local strength = math.min(math.sqrt(a.x * a.x + a.z * a.z), math.sqrt(b.x * b.x + b.z * b.z))
+  -- Same gain softening as the side thrusters: a MAX_LEAN error asks for
+  -- half the nozzle's reach at most.
+  local p = math.min(LEVEL_P, 0.5 * strength / math.sin(math.rad(MAX_LEAN)))
+  local d = LEVEL_D * math.sqrt(p / LEVEL_P)
+  nozzleI.x = clamp(nozzleI.x - LEVEL_I * up.x * dt, -strength, strength)
+  nozzleI.z = clamp(nozzleI.z - LEVEL_I * up.z * dt, -strength, strength)
+  local wantX = -p * up.x - d * upRate.x + nozzleI.x
+  local wantZ = -p * up.z - d * upRate.z + nozzleI.z
+  -- Mix the two aim axes to get that tip.
+  local det = a.x * b.z - a.z * b.x
+  if math.abs(det) < 1e-9 then return end
+  aimNozzle((wantX * b.z - wantZ * b.x) / det, (a.x * wantZ - a.z * wantX) / det)
+end
+
+-- Tips the nozzle each way and measures how fast the craft starts to lean.
+-- Each axis goes + then -, so the second pulse undoes the first.
+local function calibrateNozzle()
+  nozzleTried = true
+  local tips = {}
+  for _, axis in ipairs({ "x", "y" }) do
+    local sumX, sumZ = 0, 0
+    for _, sign in ipairs({ 1, -1 }) do
+      status = "Calibrating vector thruster " .. axis
+      aimNozzle(0, 0)
+      local b0, bt = { x = upRate.x, z = upRate.z }, now()
+      waitSeconds(0.3)
+      local base = now() - bt
+      local driftX, driftZ = (upRate.x - b0.x) / base, (upRate.z - b0.z) / base
+      local r0, u0, t0 = { x = upRate.x, z = upRate.z }, { x = up.x, z = up.z }, now()
+      local aim = 0.5 * sign
+      if axis == "x" then aimNozzle(aim, 0) else aimNozzle(0, aim) end
+      while now() - t0 < CAL_PULSE
+          and (now() - t0 < 0.3 or (up.x - u0.x) ^ 2 + (up.z - u0.z) ^ 2 < 0.0075) do
+        waitFix()
+      end
+      aimNozzle(0, 0)
+      local dt = now() - t0
+      while now() - t0 < dt + 0.3 do waitFix() end  -- nozzle swinging back
+      local span = now() - t0
+      sumX = sumX + (upRate.x - r0.x - driftX * span) / (dt * aim)
+      sumZ = sumZ + (upRate.z - r0.z - driftZ * span) / (dt * aim)
+    end
+    tips[axis] = { x = sumX / 2, z = sumZ / 2 }
+  end
+  local function strong(t) return t.x * t.x + t.z * t.z > 0.003 * 0.003 end
+  if strong(tips.x) and strong(tips.y) then
+    nozzleStrength = math.min(math.sqrt(tips.x.x ^ 2 + tips.x.z ^ 2), math.sqrt(tips.y.x ^ 2 + tips.y.z ^ 2))
+    nozzleTip = {
+      x = rotate(orient, { x = tips.x.x, y = 0, z = tips.x.z }, true),
+      y = rotate(orient, { x = tips.y.x, y = 0, z = tips.y.z }, true),
+    }
+  end
+end
+
 -- Lift control: turns the altitude error into a capped climb/sink speed,
 -- then drives the lift to hit that speed. `hover` slowly learns the real
 -- power that holds the craft level, so a wrong HOVER_POWER corrects itself.
@@ -252,26 +341,20 @@ local function altitudeLoop()
       wantVy = clamp(ALT_P * (altTarget - pos.y), -MAX_CLIMB, MAX_CLIMB)
     end
     local speedErr = wantVy - vel.y
-    if up.y < math.cos(math.rad(MAX_TILT)) then
+    -- The nozzle needs the lift running to level the craft, so with one
+    -- it only cuts out when upside down.
+    local cutoff = nozzleTip and 0 or math.cos(math.rad(MAX_TILT))
+    if up.y < cutoff then
       -- Tipped over: the lift would only push sideways or down.
       setThrust(LIFT_SIDE, 0)
     else
       -- Only learn hover power while nearly level, and push harder when
       -- leaning since only part of the lift points up.
       if up.y > 0.95 then hover = clamp(hover + ALT_I * speedErr * dt, 0, 15) end
-      setThrust(LIFT_SIDE, (hover + SPEED_GAIN * speedErr) / up.y)
+      setThrust(LIFT_SIDE, (hover + SPEED_GAIN * speedErr) / math.max(up.y, 0.5))
     end
+    if nozzleTip and orient and not nozzlePaused then levelNozzle() end
   end
-end
-
-local function waitFix()
-  os.pullEvent("fix")
-  return pos
-end
-
-local function waitSeconds(s)
-  local untilT = now() + s
-  while now() < untilT do waitFix() end
 end
 
 local leanI = { x = 0, z = 0 }
@@ -303,10 +386,15 @@ local function driveSides(wx, wz, errX, errZ)
     local d = worldDir(side)
     local tip = orient and sideTip[side] and rotate(orient, sideTip[side])
     local push = 0
-    if tip then
+    if tip and not nozzleTip then
       push = (levX * tip.x + levZ * tip.z) / (tip.x * tip.x + tip.z * tip.z)
     elseif d and sideAccel[side] then
       push = (errX * d.x + errZ * d.z) / (sideAccel[side] * RESPONSE_TIME)
+      -- With nozzle leveling, keep each side from tipping the craft harder
+      -- than half of what the nozzle can correct.
+      if tip and nozzleTip then
+        push = math.min(push, 0.5 * nozzleStrength / math.sqrt(tip.x * tip.x + tip.z * tip.z))
+      end
     end
     setThrust(side, push > 0 and push * 15 or 0)
   end
@@ -366,16 +454,24 @@ end
 -- back so the second pulse cancels the first one's drift.
 local function calibrate()
   -- Pulses are only readable once the climb has settled.
-  status = "Settling at cruise altitude"
-  local calmSince = now()
+  if nozzle and orient and not nozzleTried then calibrateNozzle() end
+  status = "Settling"
+  -- With nozzle leveling, also wait for it to come level (gives up after 15 s).
+  local calmSince, giveUp = now(), now() + 15
   while now() - calmSince < 2 do
     waitFix()
-    if math.abs(vel.y) > 1 or math.abs(pos.y - altTarget) > 3 then calmSince = now() end
+    if math.abs(vel.y) > 1 or math.abs(pos.y - altTarget) > 3
+        or (nozzleTip and up.y < 0.9986 and now() < giveUp) then
+      calmSince = now()
+    end
   end
   for i, side in ipairs({ "front", "back", "left", "right" }) do
     status = "Calibrating " .. side
-    -- Drift with nothing firing (drag, lean), so it can be taken out of the pulse.
+    -- Drift with nothing firing (drag, lean), so it can be taken out of the
+    -- pulse. The nozzle is centered too, or it would hide the side's tip.
     horizontalOff()
+    nozzlePaused = true
+    aimNozzle(0, 0)
     local b0, bv, bt = { x = upRate.x, z = upRate.z }, { x = vel.x, z = vel.z }, now()
     waitSeconds(0.5)
     local base = now() - bt
@@ -403,6 +499,7 @@ local function calibrate()
     -- ramp-down lag roughly cancel, so the pulse counts as dt at full power.
     while now() - t0 < dt + 0.3 do track() end
     local span = now() - t0
+    nozzlePaused = false
     local dx = vel.x - v0.x - liftX - dragX * span
     local dz = vel.z - v0.z - liftZ - dragZ * span
     local len = math.sqrt(dx * dx + dz * dz)
@@ -420,7 +517,7 @@ local function calibrate()
         sideTip[side] = rotate(orient, { x = tx, y = 0, z = tz }, true)
       end
       -- After each pair, level out with the sides measured so far.
-      if i % 2 == 0 then
+      if i % 2 == 0 and not nozzleTip then
         status = "Calibrating: leveling"
         local untilT = now() + 2
         while now() < untilT do
@@ -438,7 +535,7 @@ local function calibrate()
     local sign = (d.x * tip.x + d.y * tip.y + d.z * tip.z) >= 0 and 1 or -1
     sum, n = sum + sign * sideAccel[side] / len, n + 1
   end
-  if n == #THRUST_SIDES then lever = sum / n end
+  if n == #THRUST_SIDES and not nozzleTip then lever = sum / n end
   -- Brake any leftover drift before cruising
   status = "Calibrating: settling"
   local hold = { x = pos.x, z = pos.z }
@@ -504,9 +601,15 @@ local function missionLoop()
 
   mode = "CLIMB"
   local pad = { x = pos.x, z = pos.z }
+  local padY = pos.y
   altTarget = math.min(pos.y + CAL_HEIGHT, CRUISE_Y)
   while pos.y < altTarget - 2 do
     status = string.format("Climbing to %.0f to calibrate", altTarget)
+    -- Calibrate the vector thruster as soon as it's clear of the ground,
+    -- so it's leveling before an off-center lift can tip the craft far.
+    if nozzle and orient and not nozzleTried and pos.y > padY + 3 then
+      calibrateNozzle()
+    end
     waitFix()
   end
 
@@ -579,7 +682,9 @@ local function screenLoop()
       local tilt = math.deg(math.acos(clamp(up.y, -1, 1)))
       local n = 0
       for _ in pairs(sideAccel) do n = n + 1 end
-      local lv = lever and "on" or n < #THRUST_SIDES and "after calibration"
+      local lv = nozzleTip and "on (vector thruster)" or lever and "on (side thrusters)"
+        or n < #THRUST_SIDES and (nozzle and "vector thruster, after calibration" or "after calibration")
+        or nozzle and "OFF - aiming the vector thruster didn't tip it"
         or "OFF - side thrusters don't tip it"
       print(string.format("Tilt:   %.0f deg%s", tilt, tilt > MAX_TILT and " - TIPPED, lift off" or ""))
       print("Level:  " .. lv)
@@ -607,6 +712,12 @@ if onSable then
   end
 elseif not peripheral.find("modem", function(_, m) return m.isWireless() end) then
   error("Not on a Sable ship and no wireless modem for GPS", 0)
+end
+for _, t in ipairs({ "vector_thruster", "creative_vector_thruster", "liquid_vector_thruster" }) do
+  nozzle = nozzle or peripheral.find(t)
+end
+if nozzle and not onSable then
+  print("Vector thruster found, but aiming it needs CC: Sable; it stays centered.")
 end
 sensor = peripheral.find("optical_sensor")
 if not sensor then

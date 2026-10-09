@@ -6,7 +6,12 @@ On a Sable ship (CC: Sable installed) it reads the ship's exact position, rotati
 
 ## Leveling
 
-On a Sable ship it watches how far the craft is leaning. If the side thrusters tip the craft when they fire (they sit above or below its center of mass), it uses them to hold it level, and it steers by leaning, the way a drone does. The screen shows `Level: on` once that's working. `Level: OFF` means the side thrusters push the craft without tipping it, so nothing can correct a lean. Mount them a block or two above or below the center of mass. Either way, put the lift thruster right under the center of mass, because an off-center lift tips the craft before calibration can start. If it leans past MAX_TILT (60°) the lift cuts out instead of driving the craft into the ground.
+On a Sable ship it watches how far the craft is leaning and holds it level.
+
+- **Vector thruster (best).** If a vector thruster is attached to the computer (touching it, or on a wired modem), it's found automatically. A few blocks off the ground it aims the nozzle each way to learn which way that tips the craft, then aims it every tick to keep the craft level. The side thrusters then only push it toward the target. The screen shows `Level: on (vector thruster)`.
+- **Side thrusters.** Without a vector thruster, side thrusters mounted above or below the center of mass hold it level instead, and it steers by leaning like a drone (`Level: on (side thrusters)`). If they're level with the center of mass they can't tip it (`Level: OFF`).
+
+Put the lift thruster as close to under the center of mass as you can, especially without a vector thruster. Without nozzle leveling, the lift cuts out past MAX_TILT (60°) instead of driving the craft into the ground.
 
 ## Install
 
