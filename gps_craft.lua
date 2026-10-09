@@ -7,10 +7,12 @@
 -- Usage:  gps_craft <x> <y> <z>      or just  gps_craft  and type them in.
 --
 -- Flight plan:
---   1. CLIMB      lift thruster (LIFT_SIDE) climbs to CRUISE_Y
+--   1. CLIMB      lift thruster (LIFT_SIDE) climbs CAL_HEIGHT above the pad
 --   2. CALIBRATE  pulses each side thruster once to learn which way it pushes
---   3. CRUISE     flies level to the target X/Z
---   4. DESCEND    sinks at DESCENT_SPEED onto the target, holding X/Z over it
+--                 and which way it tips the craft
+--   3. CLIMB      keeps climbing to CRUISE_Y, holding X/Z over the pad
+--   4. CRUISE     flies to the target X/Z
+--   5. DESCEND    sinks at DESCENT_SPEED onto the target, holding X/Z over it
 -- During the descent, a downward-facing Create Simulated Optical Sensor watches
 -- the distance to the ground. When it's within DETONATE_DISTANCE, the side
 -- outputs fire. Hold Ctrl+T to abort; all outputs switch off.
@@ -56,6 +58,18 @@ BRAKE_MARGIN = 0.5
 -- snappier, higher is gentler.
 RESPONSE_TIME = 0.5
 CAL_PULSE = 1.5         -- seconds per calibration pulse
+CAL_HEIGHT = 10         -- calibrate this far above the launch point
+
+-- Leveling (Sable only). Side thrusters that tip the craft when they fire
+-- (mounted above or below its center of mass) are used to hold it level.
+LEVEL_P = 2.0           -- how hard it pulls back toward level
+LEVEL_D = 2.0           -- damping on the lean; raise it if it wobbles
+LEVEL_I = 0.5           -- how fast it learns a steady lean (lift off-center)
+MAX_LEAN = 15           -- most it leans on purpose to steer (degrees)
+LEAN_RESPONSE = 1.5     -- seconds the lean gets to fix a speed error
+-- Past this lean (degrees) the lift shuts off, so a tipped craft doesn't
+-- drive itself sideways or into the ground.
+MAX_TILT = 60
 
 -- ===================== END OF SETTINGS =======================
 
@@ -71,6 +85,11 @@ local mode = "CLIMB"
 local thrustDir = {}   -- side -> unit vector it pushes the craft (ship frame on Sable)
 local sideAccel = {}   -- side -> blocks/s^2 at full power, from calibration
 local orient = nil     -- ship rotation quaternion on Sable, nil with GPS
+local up = { x = 0, y = 1, z = 0 }  -- craft's up direction in world space
+local upRate = { x = 0, z = 0 }     -- how fast it's leaning (per second)
+local sideTip = {}     -- side -> how it tips the craft at full power (ship frame)
+local lever = nil      -- side push per unit of tip; set when all sides can level
+local gravity = 9.81   -- blocks/s^2, read from aero.getGravity() on Sable
 local navSource = "GPS"
 local status = ""
 
@@ -168,7 +187,16 @@ local function sableLoop()
           z = vel.z * (1 - a) + (p.z - pos.z) / dt * a,
         }
       end
-      pos, orient, lastFix = { x = p.x, y = p.y, z = p.z }, pose.orientation, t
+      orient = pose.orientation
+      local u = rotate(orient, { x = 0, y = 1, z = 0 })
+      if pos and t > lastFix then
+        local dt, a = t - lastFix, 0.5
+        upRate = {
+          x = upRate.x * (1 - a) + (u.x - up.x) / dt * a,
+          z = upRate.z * (1 - a) + (u.z - up.z) / dt * a,
+        }
+      end
+      pos, up, lastFix = { x = p.x, y = p.y, z = p.z }, u, t
       os.queueEvent("fix")
     else
       status = "Lost the ship pose - holding hover power"
@@ -218,8 +246,15 @@ local function altitudeLoop()
       wantVy = clamp(ALT_P * (altTarget - pos.y), -MAX_CLIMB, MAX_CLIMB)
     end
     local speedErr = wantVy - vel.y
-    hover = clamp(hover + ALT_I * speedErr * dt, 0, 15)
-    setThrust(LIFT_SIDE, hover + SPEED_GAIN * speedErr)
+    if up.y < math.cos(math.rad(MAX_TILT)) then
+      -- Tipped over: the lift would only push sideways or down.
+      setThrust(LIFT_SIDE, 0)
+    else
+      -- Only learn hover power while nearly level, and push harder when
+      -- leaning since only part of the lift points up.
+      if up.y > 0.95 then hover = clamp(hover + ALT_I * speedErr * dt, 0, 15) end
+      setThrust(LIFT_SIDE, (hover + SPEED_GAIN * speedErr) / up.y)
+    end
   end
 end
 
@@ -233,17 +268,67 @@ local function waitSeconds(s)
   while now() < untilT do waitFix() end
 end
 
+local leanI = { x = 0, z = 0 }
+local lastSteer = nil
+
+-- Weakest tipping strength among the measured sides.
+local function tipStrength()
+  local s = math.huge
+  for _, tip in pairs(sideTip) do
+    s = math.min(s, math.sqrt(tip.x * tip.x + tip.y * tip.y + tip.z * tip.z))
+  end
+  return s
+end
+
+-- Leveling gains, softened for weak side thrusters so they don't max out
+-- and overshoot: a MAX_LEAN error asks for half their strength at most.
+local function levelGains()
+  local p = math.min(LEVEL_P, 0.5 * tipStrength() / math.sin(math.rad(MAX_LEAN)))
+  return p, LEVEL_D * math.sqrt(p / LEVEL_P)
+end
+
+-- Fires the side thrusters. Sides known to tip the craft hold its lean at
+-- (wx, wz) (0, 0 is level); the rest push to fix the speed error.
+local function driveSides(wx, wz, errX, errZ)
+  local p, d = levelGains()
+  local levX = p * (wx - up.x) - d * upRate.x + leanI.x
+  local levZ = p * (wz - up.z) - d * upRate.z + leanI.z
+  for _, side in ipairs(THRUST_SIDES) do
+    local d = worldDir(side)
+    local tip = orient and sideTip[side] and rotate(orient, sideTip[side])
+    local push = 0
+    if tip then
+      push = (levX * tip.x + levZ * tip.z) / (tip.x * tip.x + tip.z * tip.z)
+    elseif d and sideAccel[side] then
+      push = (errX * d.x + errZ * d.z) / (sideAccel[side] * RESPONSE_TIME)
+    end
+    setThrust(side, push > 0 and push * 15 or 0)
+  end
+end
+
 -- Steers toward (tx, tz). It picks the speed it wants from the distance
--- left, capped so it can always brake in time (v = sqrt(2 * a * d) using
--- the weakest thruster's measured strength), then fires each side thruster
--- in proportion to how much it helps close the gap to that speed.
+-- left, capped so it can always brake in time (v = sqrt(2 * a * d)).
+-- Without leveling it fires each side thruster in proportion to how much it
+-- helps close the gap to that speed. With leveling it flies like a drone:
+-- it picks a lean that points the lift where it wants to go, and the side
+-- thrusters tip the craft to that lean.
 local function steer(tx, tz)
   local ex, ez = tx - pos.x, tz - pos.z
   local dist = math.sqrt(ex * ex + ez * ez)
+  local leveling = lever ~= nil and orient ~= nil
+  local t = now()
+  local dt = lastSteer and math.min(t - lastSteer, 0.5) or 0
+  lastSteer = t
 
+  -- The lean can't steer faster than the leveling can tip the craft.
+  local response = math.max(LEAN_RESPONSE, 3 / math.sqrt(levelGains()))
   local brake = math.huge
-  for _, a in pairs(sideAccel) do brake = math.min(brake, a) end
-  if brake == math.huge then brake = 1 end
+  if leveling then
+    brake = gravity * math.sin(math.rad(MAX_LEAN))
+  else
+    for _, a in pairs(sideAccel) do brake = math.min(brake, a) end
+    if brake == math.huge then brake = 1 end
+  end
   brake = brake * BRAKE_MARGIN
 
   local wantVx, wantVz = 0, 0
@@ -253,14 +338,21 @@ local function steer(tx, tz)
   end
   local errX, errZ = wantVx - vel.x, wantVz - vel.z
 
-  for _, side in ipairs(THRUST_SIDES) do
-    local d = worldDir(side)
-    local push = 0
-    if d and sideAccel[side] then
-      push = (errX * d.x + errZ * d.z) / (sideAccel[side] * RESPONSE_TIME)
-    end
-    setThrust(side, push > 0 and push * 15 or 0)
+  local wx, wz = 0, 0
+  if leveling then
+    -- Tipping the craft also shoves it sideways, so take that shove out
+    -- of the speed the lean is steering.
+    local ax = (wantVx - (vel.x - lever * upRate.x)) / response
+    local az = (wantVz - (vel.z - lever * upRate.z)) / response
+    wx, wz = ax / gravity, az / gravity
+    local m, cap = math.sqrt(wx * wx + wz * wz), math.sin(math.rad(MAX_LEAN))
+    if m > cap then wx, wz = wx / m * cap, wz / m * cap end
+    -- Integral holds the lean against a steady push (lift off-center).
+    local limit = tipStrength()
+    leanI.x = clamp(leanI.x + LEVEL_I * (wx - up.x) * dt, -limit, limit)
+    leanI.z = clamp(leanI.z + LEVEL_I * (wz - up.z) * dt, -limit, limit)
   end
+  driveSides(wx, wz, errX, errZ)
 end
 
 -- Pulses each side thruster and measures the change in velocity it caused,
@@ -272,26 +364,75 @@ local function calibrate()
   local calmSince = now()
   while now() - calmSince < 2 do
     waitFix()
-    if math.abs(vel.y) > 1 or math.abs(pos.y - CRUISE_Y) > 3 then calmSince = now() end
+    if math.abs(vel.y) > 1 or math.abs(pos.y - altTarget) > 3 then calmSince = now() end
   end
-  for _, side in ipairs({ "front", "back", "left", "right" }) do
+  for i, side in ipairs({ "front", "back", "left", "right" }) do
     status = "Calibrating " .. side
-    waitSeconds(0.3)
-    local v0 = { x = vel.x, z = vel.z }
-    local t0 = now()
+    -- Drift with nothing firing (drag, lean), so it can be taken out of the pulse.
+    horizontalOff()
+    local b0, bv, bt = { x = upRate.x, z = upRate.z }, { x = vel.x, z = vel.z }, now()
+    waitSeconds(0.5)
+    local base = now() - bt
+    local driftX, driftZ = (upRate.x - b0.x) / base, (upRate.z - b0.z) / base
+    local dragX, dragZ = (vel.x - bv.x) / base, (vel.z - bv.z) / base
+    local v0, r0 = { x = vel.x, z = vel.z }, { x = upRate.x, z = upRate.z }
+    local t0, last = now(), now()
+    local u0 = { x = up.x, z = up.z }
+    local liftX, liftZ = 0, 0  -- push from the lift while the craft leans
+    local function track()
+      waitFix()
+      local t = now()
+      liftX, liftZ = liftX + gravity * up.x * (t - last), liftZ + gravity * up.z * (t - last)
+      last = t
+    end
     setThrust(side, 15)
-    waitSeconds(CAL_PULSE)
+    -- Cut the pulse short once it has tipped the craft about 5 degrees.
+    while now() - t0 < CAL_PULSE
+        and (now() - t0 < 0.3 or (up.x - u0.x) ^ 2 + (up.z - u0.z) ^ 2 < 0.0075) do
+      track()
+    end
     setThrust(side, 0)
-    local dx, dz = vel.x - v0.x, vel.z - v0.z
+    local dt = now() - t0
+    -- Keep measuring while the thruster spins down; its ramp-up and
+    -- ramp-down lag roughly cancel, so the pulse counts as dt at full power.
+    while now() - t0 < dt + 0.3 do track() end
+    local span = now() - t0
+    local dx = vel.x - v0.x - liftX - dragX * span
+    local dz = vel.z - v0.z - liftZ - dragZ * span
     local len = math.sqrt(dx * dx + dz * dz)
     if len < 0.05 then
       error("Side '" .. side .. "' didn't move the craft during calibration", 0)
     end
-    sideAccel[side] = len / (now() - t0)
+    sideAccel[side] = len / dt
     local dir = { x = dx / len, y = 0, z = dz / len }
     -- On Sable, store it in the ship's own frame so turning mid-flight is handled.
     thrustDir[side] = orient and rotate(orient, dir, true) or dir
+    if orient then
+      local tx = (upRate.x - r0.x - driftX * span) / dt
+      local tz = (upRate.z - r0.z - driftZ * span) / dt
+      if tx * tx + tz * tz > 0.003 * 0.003 then
+        sideTip[side] = rotate(orient, { x = tx, y = 0, z = tz }, true)
+      end
+      -- After each pair, level out with the sides measured so far.
+      if i % 2 == 0 then
+        status = "Calibrating: leveling"
+        local untilT = now() + 2
+        while now() < untilT do
+          driveSides(0, 0, 0, 0)
+          waitFix()
+        end
+      end
+    end
   end
+  -- Leveling needs every side, so it can tip the craft every way.
+  local sum, n = 0, 0
+  for side, tip in pairs(sideTip) do
+    local d = thrustDir[side]
+    local len = math.sqrt(tip.x * tip.x + tip.y * tip.y + tip.z * tip.z)
+    local sign = (d.x * tip.x + d.y * tip.y + d.z * tip.z) >= 0 and 1 or -1
+    sum, n = sum + sign * sideAccel[side] / len, n + 1
+  end
+  if n == #THRUST_SIDES then lever = sum / n end
   -- Brake any leftover drift before cruising
   status = "Calibrating: settling"
   local hold = { x = pos.x, z = pos.z }
@@ -356,9 +497,10 @@ local function missionLoop()
   waitFix()
 
   mode = "CLIMB"
-  altTarget = CRUISE_Y
-  while pos.y < CRUISE_Y - 2 do
-    status = string.format("Climbing to %d", CRUISE_Y)
+  local pad = { x = pos.x, z = pos.z }
+  altTarget = math.min(pos.y + CAL_HEIGHT, CRUISE_Y)
+  while pos.y < altTarget - 2 do
+    status = string.format("Climbing to %.0f to calibrate", altTarget)
     waitFix()
   end
 
@@ -369,11 +511,32 @@ local function missionLoop()
     horizontalOff()
     mode = "HOLD"
     status = tostring(err) .. ". Hovering - Ctrl+T to stop."
-    while true do waitFix() end
+    local hold = { x = pos.x, z = pos.z }
+    while true do
+      steer(hold.x, hold.z)
+      waitFix()
+    end
+  end
+
+  mode = "CLIMB"
+  altTarget = CRUISE_Y
+  while pos.y < CRUISE_Y - 2 do
+    status = string.format("Climbing to %d", CRUISE_Y)
+    steer(pad.x, pad.z)
+    waitFix()
   end
 
   mode = "CRUISE"
+  -- A craft steering by leaning can end up circling just outside the radius,
+  -- so close enough for 10 seconds also counts.
+  local nearSince = nil
   while horizontalDistance() > ARRIVE_RADIUS do
+    if horizontalDistance() < ARRIVE_RADIUS * 4 then
+      nearSince = nearSince or now()
+      if now() - nearSince > 10 then break end
+    else
+      nearSince = nil
+    end
     status = string.format("%.0f blocks to target", horizontalDistance())
     steer(target.x, target.z)
     waitFix()
@@ -394,7 +557,7 @@ local function screenLoop()
     term.setCursorPos(1, 1)
     print("GPS Craft  [" .. mode .. "]")
     print("")
-    print(string.format("Target: %d %d %d", target.x, target.y, target.z))
+    print(string.format("Target: %.0f %.0f %.0f", target.x, target.y, target.z))
     if pos then
       print(string.format("Pos:    %.1f %.1f %.1f", pos.x, pos.y, pos.z))
       print(string.format("Dist:   %.1f", horizontalDistance()))
@@ -406,6 +569,15 @@ local function screenLoop()
       print(string.format("Sensor: redstone %d  (fires at %d)", rs.getAnalogInput(SENSOR_SIDE), TRIGGER_STRENGTH))
     end
     print(string.format("Lift:   hover power %.1f   Nav: %s", hover, navSource))
+    if orient then
+      local tilt = math.deg(math.acos(clamp(up.y, -1, 1)))
+      local n = 0
+      for _ in pairs(sideAccel) do n = n + 1 end
+      local lv = lever and "on" or n < #THRUST_SIDES and "after calibration"
+        or "OFF - side thrusters don't tip it"
+      print(string.format("Tilt:   %.0f deg%s", tilt, tilt > MAX_TILT and " - TIPPED, lift off" or ""))
+      print("Level:  " .. lv)
+    end
     print("")
     print(status)
     print("")
@@ -422,6 +594,11 @@ term.setCursorPos(1, 1)
 local onSable = sublevel ~= nil and sublevel.isInPlotGrid()
 if onSable then
   navSource = "Sable"
+  if aero then
+    local ok, g = pcall(aero.getGravity)
+    local m = ok and type(g) == "table" and g.length and g:length()
+    if m and m > 0.5 and m < 100 then gravity = m end
+  end
 elseif not peripheral.find("modem", function(_, m) return m.isWireless() end) then
   error("Not on a Sable ship and no wireless modem for GPS", 0)
 end
