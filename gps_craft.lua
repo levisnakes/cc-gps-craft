@@ -6,9 +6,10 @@
 --   1. CLIMB      lift thruster (LIFT_SIDE) climbs to CRUISE_Y
 --   2. CALIBRATE  pulses each side thruster once to learn which way it pushes
 --   3. CRUISE     flies level to the target X/Z
---   4. DESCEND    drops toward the target Y and holds position
--- Once within ARM_DISTANCE of the target, a strength-14 signal on SENSOR_SIDE
--- fires the payload. Hold Ctrl+T to abort; all outputs switch off.
+--   4. DESCEND    sinks at DESCENT_SPEED onto the target, holding X/Z over it
+-- During the descent, a downward-facing Create Simulated Optical Sensor watches
+-- the distance to the ground. When it's within DETONATE_DISTANCE, the side
+-- outputs fire. Hold Ctrl+T to abort; all outputs switch off.
 
 -- ======================== SETTINGS ===========================
 
@@ -19,7 +20,13 @@ THRUST_SIDES = { "front", "back", "left", "right" }
 CRUISE_Y = 200          -- altitude to fly at
 HOVER_POWER = 8         -- lift strength (0-15) that roughly holds altitude
 ARRIVE_RADIUS = 3       -- blocks from target X/Z counted as "over the target"
-ARM_DISTANCE = 30       -- sensor is ignored until this close (stops launch-pad triggers)
+DESCENT_SPEED = 5       -- blocks per second while dropping onto the target
+
+-- Optical Sensor (laser pointing down), found automatically on the network or
+-- touching the computer. It's only checked during the descent.
+DETONATE_DISTANCE = 3   -- fire when the laser hits something this close (blocks)
+-- Without an Optical Sensor peripheral, a redstone signal of at least this
+-- strength on SENSOR_SIDE fires instead, or reaching the target Y.
 TRIGGER_STRENGTH = 14
 
 -- Payload outputs, fired together when the sensor triggers. By default these are
@@ -112,12 +119,18 @@ local function gpsLoop()
   end
 end
 
--- Holds altTarget with a PD controller on the lift thruster.
+-- Holds altTarget with a PD controller on the lift thruster. While
+-- descending it holds a steady sink rate instead, so it keeps going down
+-- until the sensor fires, wherever the ground actually is.
 local function altitudeLoop()
   while true do
     os.pullEvent("fix")
-    local err = altTarget - pos.y
-    setThrust(LIFT_SIDE, HOVER_POWER + ALT_P * err - ALT_D * vel.y)
+    if mode == "DESCEND" then
+      setThrust(LIFT_SIDE, HOVER_POWER + ALT_D * (-DESCENT_SPEED - vel.y))
+    else
+      local err = altTarget - pos.y
+      setThrust(LIFT_SIDE, HOVER_POWER + ALT_P * err - ALT_D * vel.y)
+    end
   end
 end
 
@@ -189,12 +202,31 @@ local function firePayload()
   sleep(PAYLOAD_SECONDS)
 end
 
--- Fires the payload when armed and the sensor reads TRIGGER_STRENGTH.
+local sensor = nil
+
+-- Distance to whatever the laser hits, or nil if nothing is in range.
+local function sensorDistance()
+  if not sensor then return nil end
+  local ok, hit = pcall(sensor.hasHit)
+  if not ok or not hit then return nil end
+  local ok2, d = pcall(sensor.getDistance)
+  return ok2 and d or nil
+end
+
+local function shouldDetonate()
+  if sensor then
+    local d = sensorDistance()
+    return d ~= nil and d <= DETONATE_DISTANCE
+  end
+  return rs.getAnalogInput(SENSOR_SIDE) >= TRIGGER_STRENGTH or pos.y <= target.y
+end
+
+-- Armed only during the descent, so nothing below the launch pad or the
+-- flight path can set it off.
 local function sensorLoop()
   while true do
     os.pullEvent()
-    if pos and target and horizontalDistance() <= ARM_DISTANCE
-        and rs.getAnalogInput(SENSOR_SIDE) == TRIGGER_STRENGTH then
+    if mode == "DESCEND" and shouldDetonate() then
       firePayload()
       return
     end
@@ -222,9 +254,9 @@ local function missionLoop()
   end
 
   mode = "DESCEND"
-  altTarget = target.y
   while true do
-    status = string.format("Over target, altitude %.0f -> %d", pos.y, target.y)
+    local d = sensorDistance()
+    status = string.format("Dropping onto target, ground %s", d and string.format("%.1f blocks", d) or "not in range")
     steer(target.x, target.z)
     waitFix()
   end
@@ -241,7 +273,12 @@ local function screenLoop()
       print(string.format("Pos:    %.1f %.1f %.1f", pos.x, pos.y, pos.z))
       print(string.format("Dist:   %.1f", horizontalDistance()))
     end
-    print(string.format("Sensor: %d  (fires at %d)", rs.getAnalogInput(SENSOR_SIDE), TRIGGER_STRENGTH))
+    if sensor then
+      local d = sensorDistance()
+      print(string.format("Sensor: %s  (fires at %d)", d and string.format("%.1f", d) or "--", DETONATE_DISTANCE))
+    else
+      print(string.format("Sensor: redstone %d  (fires at %d)", rs.getAnalogInput(SENSOR_SIDE), TRIGGER_STRENGTH))
+    end
     print("")
     print(status)
     print("")
@@ -257,6 +294,10 @@ term.clear()
 term.setCursorPos(1, 1)
 if not peripheral.find("modem", function(_, m) return m.isWireless() end) then
   error("No wireless modem: the craft needs one for GPS", 0)
+end
+sensor = peripheral.find("optical_sensor")
+if not sensor then
+  print("No Optical Sensor found; using redstone on " .. SENSOR_SIDE .. " instead.")
 end
 target = getTarget(args)
 
