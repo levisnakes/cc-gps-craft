@@ -187,7 +187,13 @@ local function sableLoop()
           z = vel.z * (1 - a) + (p.z - pos.z) / dt * a,
         }
       end
-      orient = pose.orientation
+      -- CC: Sable hands back a quaternion object (v = x/y/z, a = w).
+      local o = pose.orientation
+      if o.v then
+        orient = { x = o.v.x, y = o.v.y, z = o.v.z, w = o.a }
+      else
+        orient = { x = o.x, y = o.y, z = o.z, w = o.w }
+      end
       local u = rotate(orient, { x = 0, y = 1, z = 0 })
       if pos and t > lastFix then
         local dt, a = t - lastFix, 0.5
