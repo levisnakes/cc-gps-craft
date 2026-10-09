@@ -4,6 +4,21 @@ ComputerCraft autopilot for a redstone-thruster craft (for example, Create Propu
 
 On a Sable ship (CC: Sable installed) it reads the ship's exact position, rotation and speed every tick through the `sublevel` API, so it needs no GPS and handles the ship turning mid-flight. Off a Sable ship it falls back to GPS, which needs a wireless modem and GPS hosts in range.
 
+## Install
+
+Run these on the craft's computer:
+
+```
+wget https://raw.githubusercontent.com/levisnakes/cc-gps-craft/main/startup.lua startup.lua
+reboot
+```
+
+If it says the file already exists, run `delete startup.lua` first.
+
+On every boot, `startup.lua` checks GitHub for a newer version, downloads it as `craft.lua`, and runs it. The version is shown in the screen title (`GPS Craft v1.4.0`). If it can't reach GitHub it runs the copy it already has.
+
+To keep your own settings across updates, put them in `craft_settings.lua` (same lines as the settings at the top of the script, for example `CRUISE_Y = 150`). Updates never touch that file.
+
 ## Leveling
 
 On a Sable ship it watches how far the craft is leaning and holds it level.
@@ -24,17 +39,6 @@ Messages go through the free ntfy.sh relay. It allows about 250 messages a day p
 ## Flight log
 
 Every flight writes `craft.log` on the computer: the calibration results, then the height, lean, nozzle aim and every thruster output five times a second. To share it, run `pastebin put craft.log` and send the link it prints.
-
-## Install
-
-```
-wget https://raw.githubusercontent.com/levisnakes/cc-gps-craft/main/startup.lua startup.lua
-reboot
-```
-
-On every boot, `startup.lua` checks GitHub for a newer version, downloads it as `craft.lua`, and runs it. The version is shown in the screen title (`GPS Craft v1.4.0`). If it can't reach GitHub it runs the copy it already has.
-
-To keep your own settings across updates, put them in `craft_settings.lua` (same lines as the settings at the top of the script, for example `CRUISE_Y = 150`). Updates never touch that file.
 
 ## Use
 
