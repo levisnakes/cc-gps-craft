@@ -15,7 +15,7 @@ reboot
 
 If it says the file already exists, run `delete startup.lua` first.
 
-On every boot, `startup.lua` checks GitHub for a newer version, downloads it as `craft.lua`, and runs it. The version is shown in the screen title (`GPS Craft v1.4.0`). If it can't reach GitHub it runs the copy it already has.
+On every boot, `startup.lua` checks GitHub for a newer version, downloads it as `craft.lua`, and runs it. The version is shown in the screen title (for example `GPS Craft v1.8.0`). If it can't reach GitHub it runs the copy it already has.
 
 To keep your own settings across updates, put them in `craft_settings.lua` (same lines as the settings at the top of the script, for example `CRUISE_Y = 150`). Updates never touch that file.
 
