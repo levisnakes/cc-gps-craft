@@ -18,7 +18,8 @@ SENSOR_SIDE = "top"
 THRUST_SIDES = { "front", "back", "left", "right" }
 
 CRUISE_Y = 200          -- altitude to fly at
-HOVER_POWER = 8         -- lift strength (0-15) that roughly holds altitude
+HOVER_POWER = 8         -- starting guess for the lift strength that holds altitude; corrected in flight
+MAX_CLIMB = 6           -- max climb/sink speed while changing altitude (blocks per second)
 ARRIVE_RADIUS = 3       -- blocks from target X/Z counted as "over the target"
 DESCENT_SPEED = 5       -- blocks per second while dropping onto the target
 
@@ -37,9 +38,11 @@ PAYLOAD_RELAY = nil     -- e.g. "redstone_relay_0"
 PAYLOAD_SECONDS = 2
 
 -- Controller tuning. Raise the P values if it's sluggish, raise D if it overshoots.
-ALT_P, ALT_D = 0.8, 2.0
+ALT_P = 0.5             -- how hard it chases the target altitude
+SPEED_GAIN = 2.0        -- lift change per block/s of vertical speed error
+ALT_I = 0.4             -- how fast it learns the real hover power
 POS_P, POS_D = 0.4, 1.5
-CAL_PULSE = 1.0         -- seconds per calibration pulse
+CAL_PULSE = 1.5         -- seconds per calibration pulse
 
 -- ===================== END OF SETTINGS =======================
 
@@ -49,6 +52,7 @@ local target = nil
 local pos, vel = nil, { x = 0, y = 0, z = 0 }
 local lastFix = 0
 local altTarget = CRUISE_Y
+local hover = HOVER_POWER
 local mode = "CLIMB"
 local thrustDir = {}   -- side -> unit {x, z} it pushes the craft
 local status = ""
@@ -113,24 +117,34 @@ local function gpsLoop()
       os.queueEvent("fix")
     else
       status = "NO GPS FIX - holding hover power"
-      setThrust(LIFT_SIDE, HOVER_POWER)
+      setThrust(LIFT_SIDE, hover)
       sleep(0.2)
     end
   end
 end
 
--- Holds altTarget with a PD controller on the lift thruster. While
--- descending it holds a steady sink rate instead, so it keeps going down
+-- Lift control: turns the altitude error into a capped climb/sink speed,
+-- then drives the lift to hit that speed. `hover` slowly learns the real
+-- power that holds the craft level, so a wrong HOVER_POWER corrects itself.
+-- While descending it holds a steady sink rate, so it keeps going down
 -- until the sensor fires, wherever the ground actually is.
 local function altitudeLoop()
+  local last = now()
   while true do
     os.pullEvent("fix")
+    local t = now()
+    local dt = math.min(t - last, 1)
+    last = t
+
+    local wantVy
     if mode == "DESCEND" then
-      setThrust(LIFT_SIDE, HOVER_POWER + ALT_D * (-DESCENT_SPEED - vel.y))
+      wantVy = -DESCENT_SPEED
     else
-      local err = altTarget - pos.y
-      setThrust(LIFT_SIDE, HOVER_POWER + ALT_P * err - ALT_D * vel.y)
+      wantVy = clamp(ALT_P * (altTarget - pos.y), -MAX_CLIMB, MAX_CLIMB)
     end
+    local speedErr = wantVy - vel.y
+    hover = clamp(hover + ALT_I * speedErr * dt, 0, 15)
+    setThrust(LIFT_SIDE, hover + SPEED_GAIN * speedErr)
   end
 end
 
@@ -159,6 +173,13 @@ end
 -- so the craft's facing doesn't matter. Opposite sides are pulsed back to
 -- back so the second pulse cancels the first one's drift.
 local function calibrate()
+  -- Pulses are only readable once the climb has settled.
+  status = "Settling at cruise altitude"
+  local calmSince = now()
+  while now() - calmSince < 2 do
+    waitFix()
+    if math.abs(vel.y) > 1 or math.abs(pos.y - CRUISE_Y) > 3 then calmSince = now() end
+  end
   for _, side in ipairs({ "front", "back", "left", "right" }) do
     status = "Calibrating " .. side
     waitSeconds(0.3)
@@ -168,7 +189,7 @@ local function calibrate()
     setThrust(side, 0)
     local dx, dz = vel.x - v0.x, vel.z - v0.z
     local len = math.sqrt(dx * dx + dz * dz)
-    if len < 0.1 then
+    if len < 0.05 then
       error("Side '" .. side .. "' didn't move the craft during calibration", 0)
     end
     thrustDir[side] = { x = dx / len, z = dz / len }
@@ -244,7 +265,14 @@ local function missionLoop()
   end
 
   mode = "CALIBRATE"
-  calibrate()
+  local ok, err = pcall(calibrate)
+  if not ok then
+    -- Don't drop out of the sky: hold altitude and report.
+    horizontalOff()
+    mode = "HOLD"
+    status = tostring(err) .. ". Hovering - Ctrl+T to stop."
+    while true do waitFix() end
+  end
 
   mode = "CRUISE"
   while horizontalDistance() > ARRIVE_RADIUS do
@@ -279,6 +307,7 @@ local function screenLoop()
     else
       print(string.format("Sensor: redstone %d  (fires at %d)", rs.getAnalogInput(SENSOR_SIDE), TRIGGER_STRENGTH))
     end
+    print(string.format("Lift:   hover power %.1f", hover))
     print("")
     print(status)
     print("")

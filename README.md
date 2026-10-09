@@ -18,4 +18,4 @@ craft <x> <y> <z>
 
 Or run `craft` and type the coordinates. Hold Ctrl+T to abort; every output turns off.
 
-Settings (cruise altitude, hover power, arming distance, payload outputs, controller tuning) are at the top of the file.
+Settings (cruise altitude, climb speed, detonation distance, payload outputs, controller tuning) are at the top of the file. The lift learns the power it needs to hover during flight, so HOVER_POWER is only a starting guess.
