@@ -18,7 +18,7 @@
 -- the distance to the ground. When it's within DETONATE_DISTANCE, the side
 -- outputs fire. Hold Ctrl+T to abort; all outputs switch off.
 
-VERSION = "1.4.0"  -- startup.lua compares this with version.txt on GitHub
+VERSION = "1.5.0"  -- startup.lua compares this with version.txt on GitHub
 
 -- ======================== SETTINGS ===========================
 -- Updates replace this file. To keep your own values, put them in
@@ -75,6 +75,9 @@ LEAN_RESPONSE = 1.5     -- seconds the lean gets to fix a speed error
 -- Past this lean (degrees) the lift shuts off, so a tipped craft doesn't
 -- drive itself sideways or into the ground.
 MAX_TILT = 60
+-- Side thrusters that would tip the craft further ease off from half this
+-- lean (degrees) and stop at it, until it's back under half.
+SIDE_CUT_TILT = 20
 
 -- ===================== END OF SETTINGS =======================
 
@@ -282,8 +285,11 @@ local function levelNozzle()
   -- half the nozzle's reach at most.
   local p = math.min(LEVEL_P, 0.5 * strength / math.sin(math.rad(MAX_LEAN)))
   local d = LEVEL_D * math.sqrt(p / LEVEL_P)
-  nozzleI.x = clamp(nozzleI.x - LEVEL_I * up.x * dt, -strength, strength)
-  nozzleI.z = clamp(nozzleI.z - LEVEL_I * up.z * dt, -strength, strength)
+  -- The integral shrinks with the gains too; left at full strength it
+  -- outruns the damping on a weak nozzle and the craft wobbles harder and harder.
+  local ki = LEVEL_I * (p / LEVEL_P) ^ 1.5
+  nozzleI.x = clamp(nozzleI.x - ki * up.x * dt, -strength, strength)
+  nozzleI.z = clamp(nozzleI.z - ki * up.z * dt, -strength, strength)
   local wantX = -p * up.x - d * upRate.x + nozzleI.x
   local wantZ = -p * up.z - d * upRate.z + nozzleI.z
   -- Mix the two aim axes to get that tip.
@@ -307,7 +313,7 @@ local function calibrateNozzle()
       local base = now() - bt
       local driftX, driftZ = (upRate.x - b0.x) / base, (upRate.z - b0.z) / base
       local r0, u0, t0 = { x = upRate.x, z = upRate.z }, { x = up.x, z = up.z }, now()
-      local aim = 0.5 * sign
+      local aim = 0.25 * sign
       if axis == "x" then aimNozzle(aim, 0) else aimNozzle(0, aim) end
       while now() - t0 < CAL_PULSE
           and (now() - t0 < 0.3 or (up.x - u0.x) ^ 2 + (up.z - u0.z) ^ 2 < 0.0075) do
@@ -389,7 +395,17 @@ end
 
 -- Fires the side thrusters. Sides known to tip the craft hold its lean at
 -- (wx, wz) (0, 0 is level); the rest push to fix the speed error.
+local sidesCut = false
+
 local function driveSides(wx, wz, errX, errZ)
+  -- How much of their push the sides that tip the craft further may use.
+  local lean = 1
+  if orient then
+    local tilt = math.deg(math.acos(clamp(up.y, -1, 1)))
+    if tilt > SIDE_CUT_TILT then sidesCut = true
+    elseif tilt < SIDE_CUT_TILT / 2 then sidesCut = false end
+    lean = sidesCut and 0 or clamp((SIDE_CUT_TILT - tilt) / (SIDE_CUT_TILT / 2), 0, 1)
+  end
   local p, d = levelGains()
   local levX = p * (wx - up.x) - d * upRate.x + leanI.x
   local levZ = p * (wz - up.z) - d * upRate.z + leanI.z
@@ -406,6 +422,8 @@ local function driveSides(wx, wz, errX, errZ)
       if tip and nozzleTip then
         push = math.min(push, 0.5 * nozzleStrength / math.sqrt(tip.x * tip.x + tip.z * tip.z))
       end
+      -- Unless it's known to tip the craft back toward level, back it off.
+      if not (tip and tip.x * up.x + tip.z * up.z < 0) then push = push * lean end
     end
     setThrust(side, push > 0 and push * 15 or 0)
   end
@@ -454,8 +472,9 @@ local function steer(tx, tz)
     if m > cap then wx, wz = wx / m * cap, wz / m * cap end
     -- Integral holds the lean against a steady push (lift off-center).
     local limit = tipStrength()
-    leanI.x = clamp(leanI.x + LEVEL_I * (wx - up.x) * dt, -limit, limit)
-    leanI.z = clamp(leanI.z + LEVEL_I * (wz - up.z) * dt, -limit, limit)
+    local ki = LEVEL_I * (levelGains() / LEVEL_P) ^ 1.5  -- shrinks with the gains, as above
+    leanI.x = clamp(leanI.x + ki * (wx - up.x) * dt, -limit, limit)
+    leanI.z = clamp(leanI.z + ki * (wz - up.z) * dt, -limit, limit)
   end
   driveSides(wx, wz, errX, errZ)
 end
@@ -478,6 +497,15 @@ local function calibrate()
   end
   for i, side in ipairs({ "front", "back", "left", "right" }) do
     status = "Calibrating " .. side
+    -- Let the nozzle bring it level first (up to 8 s), since it's paused
+    -- while the side is measured.
+    if nozzleTip then
+      horizontalOff()
+      local untilT = now() + 8
+      while now() < untilT and (up.y < 0.9962 or upRate.x ^ 2 + upRate.z ^ 2 > 0.0004) do
+        waitFix()
+      end
+    end
     -- Drift with nothing firing (drag, lean), so it can be taken out of the
     -- pulse. The nozzle is centered too, or it would hide the side's tip.
     horizontalOff()
@@ -697,7 +725,8 @@ local function screenLoop()
         or n < #THRUST_SIDES and (nozzle and "vector thruster, after calibration" or "after calibration")
         or nozzle and "OFF - aiming the vector thruster didn't tip it"
         or "OFF - side thrusters don't tip it"
-      print(string.format("Tilt:   %.0f deg%s", tilt, tilt > MAX_TILT and " - TIPPED, lift off" or ""))
+      local cut = nozzleTip and up.y < 0 or not nozzleTip and tilt > MAX_TILT
+      print(string.format("Tilt:   %.0f deg%s", tilt, cut and " - TIPPED, lift off" or ""))
       print("Level:  " .. lv)
     end
     print("")
