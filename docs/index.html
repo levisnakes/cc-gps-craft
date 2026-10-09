@@ -39,6 +39,7 @@
   @media (max-width: 860px) { main { grid-template-columns: 1fr; } }
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px; }
   .stack { display: grid; gap: 16px; align-content: start; }
+  #lean { width: 100%; aspect-ratio: 900 / 260; display: block; border-radius: 8px; background: var(--panel2); }
   #map { width: 100%; aspect-ratio: 4 / 3; display: block; border-radius: 8px; background: var(--panel2); cursor: crosshair; touch-action: manipulation; }
   .maphint { color: var(--dim); font-size: 13px; margin-top: 8px; }
   .chip { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; letter-spacing: .04em;
@@ -88,6 +89,11 @@
       <canvas id="map" width="900" height="675" aria-label="Top-down map of the craft, launch pad and target"></canvas>
       <div class="maphint">Click the map to put the target there. <span style="color:var(--pad)">■</span> pad
         <span style="color:var(--target)">✕</span> target <span style="color:var(--accent)">◌</span> new target (not sent yet) <span style="color:var(--craft)">●</span> craft</div>
+    </section>
+    <section class="card">
+      <h2>Lean over time</h2>
+      <canvas id="lean" width="900" height="260" aria-label="Lean in degrees over the last two minutes"></canvas>
+      <div class="maphint">Recorded 4 times a second on the craft and sent in batches, so the newest few seconds show up with each update.</div>
     </section>
     <section class="card">
       <h2>Activity</h2>
@@ -150,6 +156,7 @@
   const $ = id => document.getElementById(id);
   const RELAY = "https://ntfy.sh/";
   let code = "", ws = null, last = null, lastAt = 0, trail = [], demo = null, reconnectTimer = null;
+  let leanHist = [];  // { t: ms, tilt }
   const store = {
     get: k => { try { return localStorage.getItem(k); } catch { return null; } },
     set: (k, v) => { try { localStorage.setItem(k, v); } catch {} },
@@ -178,7 +185,7 @@
     code = $("code").value.trim().toLowerCase();
     if (!/^[a-z0-9]{4,16}$/.test(code)) { note("Enter the code shown on the craft's screen.", true); return; }
     store.set("gpscraft-code", code);
-    trail = []; last = null; lastAt = 0; clearTarget();
+    trail = []; leanHist = []; last = null; lastAt = 0; clearTarget();
     $("linkText").textContent = "Connecting…";
     // Recent history first, so the page fills in even if the craft is quiet.
     try {
@@ -219,11 +226,21 @@
     if (!t || !t.m) return;
     const prevMode = last && last.m;
     last = t; lastAt = t.ts || at;
+    // Batched samples: [seconds before ts, lean, x, y, z], oldest first.
+    for (const h of t.h || []) {
+      const st = lastAt - h[0] * 1000;
+      if (leanHist.length && st <= leanHist[leanHist.length - 1].t) continue;
+      leanHist.push({ t: st, tilt: h[1] });
+      const prev = trail[trail.length - 1];
+      if (!prev || Math.hypot(prev.x - h[2], prev.z - h[4]) > 0.3) trail.push({ x: h[2], z: h[4] });
+    }
+    if (t.tilt !== undefined && (!leanHist.length || lastAt > leanHist[leanHist.length - 1].t)) leanHist.push({ t: lastAt, tilt: t.tilt });
+    while (leanHist.length && leanHist[0].t < lastAt - 120000) leanHist.shift();
+    while (trail.length > 3000) trail.shift();
     if (t.p) {
       const p = { x: t.p[0], z: t.p[2] };
       const prev = trail[trail.length - 1];
       if (!prev || Math.hypot(prev.x - p.x, prev.z - p.z) > 0.5) trail.push(p);
-      if (trail.length > 600) trail.shift();
     }
     if (!history && prevMode && prevMode !== t.m) note(`Mode: ${t.m}`, true);
     if (t.t && !$("tx").value) { $("tx").value = t.t[0]; $("ty").value = t.t[1]; $("tz").value = t.t[2]; }
@@ -271,6 +288,36 @@
     $("pingBtn").disabled = !linked;
     $("cutBtn").disabled = !flying;
     drawMap();
+    drawLean();
+  }
+
+  // ---------- lean chart ----------
+  const lc = $("lean"), lx = lc.getContext("2d");
+  function drawLean() {
+    const css = getComputedStyle(document.documentElement);
+    const col = n => css.getPropertyValue(n).trim();
+    const W = lc.width, H = lc.height, L = 44, B = 26, top = 10;
+    lx.clearRect(0, 0, W, H);
+    const end = lastAt || Date.now(), span = 120000;
+    const max = Math.max(30, ...leanHist.map(p => p.tilt)) > 45 ? 90 : 45;
+    const X = t => L + (t - (end - span)) / span * (W - L - 8);
+    const Y = v => top + (1 - Math.min(v, max) / max) * (H - top - B);
+    lx.font = "18px system-ui"; lx.lineWidth = 1;
+    for (const v of max === 90 ? [0, 15, 35, 60, 90] : [0, 15, 35, 45]) {
+      lx.strokeStyle = v === 15 ? col("--warn") : v === 35 ? col("--bad") : col("--line");
+      lx.globalAlpha = v === 15 || v === 35 ? .5 : 1;
+      lx.beginPath(); lx.moveTo(L, Y(v)); lx.lineTo(W - 8, Y(v)); lx.stroke(); lx.globalAlpha = 1;
+      lx.fillStyle = col("--dim"); lx.fillText(v + "°", 4, Y(v) + 6);
+    }
+    for (let s = 0; s <= 120; s += 30) { lx.fillStyle = col("--dim"); lx.fillText(s ? `-${s}s` : "now", X(end - s * 1000) - (s ? 20 : 34), H - 4); }
+    const pts = leanHist.filter(p => p.t >= end - span);
+    if (pts.length > 1) {
+      lx.strokeStyle = col("--craft"); lx.lineWidth = 3; lx.beginPath();
+      pts.forEach((p, i) => { const a = X(p.t), b = Y(p.tilt); i ? lx.lineTo(a, b) : lx.moveTo(a, b); });
+      lx.stroke();
+    } else {
+      lx.fillStyle = col("--dim"); lx.fillText("No lean data yet - it fills in once the craft is flying.", L + 10, H / 2);
+    }
   }
 
   // ---------- map ----------
@@ -387,7 +434,7 @@
   function setDemo(on) {
     $("demo").checked = on;
     if (on && !demo) {
-      disconnect(); trail = []; last = null; clearTarget();
+      disconnect(); trail = []; leanHist = []; last = null; clearTarget();
       demo = makeDemo(); demo.report(); $("linkText").textContent = "Demo craft (nothing is sent anywhere)";
       note("Demo mode: a pretend craft you can fly from this page.", true);
     } else if (!on && demo) {
@@ -398,7 +445,10 @@
   function makeDemo() {
     const c = { m: "READY", s: "Waiting for a target", x: 0, y: 64, z: 0, vx: 0, vy: 0, vz: 0, armed: true, hold: null,
       pad: [0, 64, 0], t: null, tilt: 0, alt: 64 };
-    let lastT = performance.now(), sent = 0;
+    let lastT = performance.now(), sent = 0, samples = [];
+    const sampler = setInterval(() => {
+      if (["CLIMB", "CRUISE", "DESCEND"].includes(c.m)) samples.push([performance.now(), c.tilt, +c.x.toFixed(1), +c.y.toFixed(1), +c.z.toFixed(1)]);
+    }, 250);
     const tick = () => {
       const now = performance.now(), dt = Math.min(.2, (now - lastT) / 1000); lastT = now;
       const goal = c.hold || (c.t ? { x: c.t[0], z: c.t[2] } : { x: c.x, z: c.z });
@@ -427,13 +477,14 @@
       sent++;
       receive(JSON.stringify({ v: "demo", m: c.m, s: c.s, armed: c.armed, hold: !!c.hold, sent, limit: 200, ts: Date.now(),
         p: [+c.x.toFixed(1), +c.y.toFixed(1), +c.z.toFixed(1)], vel: [+c.vx.toFixed(1), +c.vy.toFixed(1), +c.vz.toFixed(1)],
+        h: (() => { const n = performance.now(); const h = samples.map(s => [+((n - s[0]) / 1000).toFixed(2), s[1], s[2], s[3], s[4]]); samples = []; return h; })(),
         t: c.t, pad: c.pad, tilt: c.tilt, lvl: c.m === "READY" ? "not calibrated yet" : "vector thruster",
         ground: +(c.y - (c.m === "DESCEND" && c.armed && c.t ? c.t[1] : 64)).toFixed(1) }), Date.now());
     };
-    const a = setInterval(tick, 50), b = setInterval(report, 1000);
+    const a = setInterval(tick, 50), b = setInterval(report, 5000);
     return {
       report,
-      stop() { clearInterval(a); clearInterval(b); },
+      stop() { clearInterval(a); clearInterval(b); clearInterval(sampler); },
       command(k) {
         const flying = ["CLIMB", "CRUISE", "DESCEND"].includes(c.m);
         if (k.c === "launch" && c.m === "READY") { c.t = [k.x, k.y, k.z]; c.m = "CLIMB"; }

@@ -18,7 +18,7 @@
 -- the distance to the ground. When it's within DETONATE_DISTANCE, the side
 -- outputs fire. Hold Ctrl+T to abort; all outputs switch off.
 
-VERSION = "1.8.0"  -- startup.lua compares this with version.txt on GitHub
+VERSION = "1.9.0"  -- startup.lua compares this with version.txt on GitHub
 
 -- ======================== SETTINGS ===========================
 -- Updates replace this file. To keep your own values, put them in
@@ -882,6 +882,9 @@ end
 
 local pendingLaunch = nil
 local wantUpdate = false
+-- Lean and position 4 times a second since the last update, so the website
+-- gets the whole flight even though updates go out every few seconds.
+local history = {}
 
 local function remoteTopic(kind)
   return "gpscraft-" .. remoteId .. "-" .. kind
@@ -939,6 +942,12 @@ local function telemetry()
     or (n < #THRUST_SIDES and "not calibrated yet" or "off")
   local d = sensorDistance()
   if d then t.ground = round1(d) end
+  -- h = { {seconds before ts, lean, x, y, z}, ... }
+  local h, nowT = {}, now()
+  for i, smp in ipairs(history) do
+    h[i] = { math.floor((nowT - smp.t) * 100 + 0.5) / 100, smp.tilt, smp.x, smp.y, smp.z }
+  end
+  if #h > 0 then t.h = h end
   return t
 end
 
@@ -952,6 +961,7 @@ local function sendUpdate()
   local ok, res = pcall(http.post, "https://ntfy.sh/" .. remoteTopic("tel"), textutils.serializeJSON(telemetry()))
   if ok and res then
     res.close()
+    history = {}
     remoteSent = n + 1
     local h = fs.open("craft_remote_count", "w")
     h.write(today .. " " .. remoteSent)
@@ -1044,7 +1054,13 @@ local function telemetryLoop()
       wantUpdate = false
       if sendUpdate() then lastSent, lastShape = now(), shape end
     end
-    sleep(0.5)
+    if flying and pos then
+      history[#history + 1] = { t = now(), x = round1(pos.x), y = round1(pos.y), z = round1(pos.z),
+        tilt = math.floor(math.deg(math.acos(clamp(up.y, -1, 1))) + 0.5) }
+      -- Keep the newest 12 s, which still fits in one ntfy message.
+      if #history > 48 then table.remove(history, 1) end
+    end
+    sleep(0.25)
   end
 end
 
