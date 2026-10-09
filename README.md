@@ -16,15 +16,16 @@ Put the lift thruster as close to under the center of mass as you can, especiall
 ## Install
 
 ```
-wget https://raw.githubusercontent.com/levisnakes/cc-gps-craft/main/gps_craft.lua craft.lua
+wget https://raw.githubusercontent.com/levisnakes/cc-gps-craft/main/startup.lua startup.lua
+reboot
 ```
+
+On every boot, `startup.lua` checks GitHub for a newer version, downloads it as `craft.lua`, and runs it. The version is shown in the screen title (`GPS Craft v1.4.0`). If it can't reach GitHub it runs the copy it already has.
+
+To keep your own settings across updates, put them in `craft_settings.lua` (same lines as the settings at the top of the script, for example `CRUISE_Y = 150`). Updates never touch that file.
 
 ## Use
 
-```
-craft <x> <y> <z>
-```
-
-Or run `craft` and type the coordinates. Hold Ctrl+T to abort; every output turns off.
+On boot it asks for the target coordinates. You can also run `craft <x> <y> <z>` (or `startup <x> <y> <z>` to update first). Hold Ctrl+T to abort; every output turns off.
 
 Settings (cruise altitude, climb speed, detonation distance, payload outputs, controller tuning) are at the top of the file. Set CRAFT_WEIGHT_PN and LIFT_THRUST_PN from the craft; the hover power is worked out from them and fine-tuned during flight.

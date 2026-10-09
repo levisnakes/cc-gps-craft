@@ -4,7 +4,8 @@
 -- rotation and speed every tick through the `sublevel` API. Otherwise it
 -- falls back to the gps API, which needs a wireless modem and GPS hosts.
 --
--- Usage:  gps_craft <x> <y> <z>      or just  gps_craft  and type them in.
+-- Usage:  craft <x> <y> <z>      or just  craft  and type them in.
+-- startup.lua keeps this file up to date and runs it on boot.
 --
 -- Flight plan:
 --   1. CLIMB      lift thruster (LIFT_SIDE) climbs CAL_HEIGHT above the pad
@@ -17,7 +18,11 @@
 -- the distance to the ground. When it's within DETONATE_DISTANCE, the side
 -- outputs fire. Hold Ctrl+T to abort; all outputs switch off.
 
+VERSION = "1.4.0"  -- startup.lua compares this with version.txt on GitHub
+
 -- ======================== SETTINGS ===========================
+-- Updates replace this file. To keep your own values, put them in
+-- craft_settings.lua instead (same lines, e.g.  CRUISE_Y = 150 ).
 
 LIFT_SIDE = "bottom"
 SENSOR_SIDE = "top"
@@ -72,6 +77,12 @@ LEAN_RESPONSE = 1.5     -- seconds the lean gets to fix a speed error
 MAX_TILT = 60
 
 -- ===================== END OF SETTINGS =======================
+
+if fs and fs.exists("craft_settings.lua") then
+  local f, err = loadfile("craft_settings.lua", nil, _ENV)
+  if not f then error("craft_settings.lua: " .. err, 0) end
+  f()
+end
 
 local ALL_SIDES = { "top", "bottom", "left", "right", "front", "back" }
 
@@ -664,7 +675,7 @@ local function screenLoop()
   while true do
     term.clear()
     term.setCursorPos(1, 1)
-    print("GPS Craft  [" .. mode .. "]")
+    print("GPS Craft v" .. VERSION .. "  [" .. mode .. "]")
     print("")
     print(string.format("Target: %.0f %.0f %.0f", target.x, target.y, target.z))
     if pos then
