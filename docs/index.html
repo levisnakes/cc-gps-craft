@@ -1,0 +1,462 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GPS Craft Control</title>
+<style>
+  :root {
+    --bg: #0f1216; --panel: #171b21; --panel2: #1e232b; --line: #2a313b;
+    --text: #e6e9ee; --dim: #8b95a3; --accent: #4da3ff; --good: #3ecf8e;
+    --warn: #f5b942; --bad: #ff5d5d; --craft: #4da3ff; --target: #ff5d5d; --pad: #3ecf8e;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f3f5f8; --panel: #ffffff; --panel2: #f0f2f5; --line: #d9dee5;
+      --text: #1b2028; --dim: #5f6b7a; --accent: #1f6fd1; --good: #12895a;
+      --warn: #a86b00; --bad: #c62828; --craft: #1f6fd1; --target: #c62828; --pad: #12895a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between;
+    padding: 14px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  h1 { font-size: 18px; margin: 0; letter-spacing: .2px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--dim); margin: 0 0 10px; font-weight: 600; }
+  .pair { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  input { background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 8px;
+    padding: 8px 10px; font: inherit; min-width: 0; }
+  input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  button { background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 8px;
+    padding: 8px 12px; font: inherit; font-weight: 600; cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger { background: transparent; border-color: var(--bad); color: var(--bad); }
+  button.danger:hover:not(:disabled) { background: var(--bad); color: #fff; }
+  main { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(300px, 1fr); gap: 16px; padding: 16px; max-width: 1300px; margin: 0 auto; }
+  @media (max-width: 860px) { main { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px; }
+  .stack { display: grid; gap: 16px; align-content: start; }
+  #map { width: 100%; aspect-ratio: 4 / 3; display: block; border-radius: 8px; background: var(--panel2); cursor: crosshair; touch-action: manipulation; }
+  .maphint { color: var(--dim); font-size: 13px; margin-top: 8px; }
+  .chip { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; letter-spacing: .04em;
+    background: var(--panel2); border: 1px solid var(--line); }
+  .chip.live { color: var(--good); border-color: var(--good); }
+  .chip.stale { color: var(--warn); border-color: var(--warn); }
+  .chip.off { color: var(--dim); }
+  .chip.armed { color: var(--bad); border-color: var(--bad); }
+  .chip.safe { color: var(--good); border-color: var(--good); }
+  .status { font-size: 17px; font-weight: 600; margin: 8px 0 2px; min-height: 1.4em; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 10px; margin-top: 12px; }
+  .stat { background: var(--panel2); border-radius: 8px; padding: 8px 10px; }
+  .stat b { display: block; font-size: 17px; font-variant-numeric: tabular-nums; }
+  .stat span { color: var(--dim); font-size: 12px; }
+  .bar { height: 6px; border-radius: 3px; background: var(--line); margin-top: 6px; overflow: hidden; }
+  .bar i { display: block; height: 100%; background: var(--good); width: 0; transition: width .3s; }
+  .coords { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-bottom: 10px; }
+  .coords label { font-size: 12px; color: var(--dim); display: grid; gap: 4px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; }
+  .row button { flex: 1 1 120px; }
+  .sep { height: 1px; background: var(--line); margin: 14px 0; }
+  #log { list-style: none; margin: 0; padding: 0; max-height: 240px; overflow: auto; font-size: 13px; }
+  #log li { padding: 4px 0; border-bottom: 1px solid var(--line); color: var(--dim); }
+  #log li b { color: var(--text); font-weight: 600; }
+  .note { color: var(--dim); font-size: 13px; }
+  .demo { display: flex; align-items: center; gap: 6px; color: var(--dim); font-size: 13px; }
+  footer { max-width: 1300px; margin: 0 auto; padding: 0 16px 24px; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>GPS Craft Control</h1>
+    <div class="note" id="linkText">Not connected</div>
+  </div>
+  <div class="pair">
+    <input id="code" placeholder="Code from the craft screen" maxlength="16" autocomplete="off" spellcheck="false" style="width: 200px">
+    <button class="primary" id="connectBtn">Connect</button>
+    <label class="demo"><input type="checkbox" id="demo"> Demo</label>
+  </div>
+</header>
+
+<main>
+  <div class="stack">
+    <section class="card">
+      <h2>Map (top-down, north up)</h2>
+      <canvas id="map" width="900" height="675" aria-label="Top-down map of the craft, launch pad and target"></canvas>
+      <div class="maphint">Click the map to put the target there. <span style="color:var(--pad)">■</span> pad
+        <span style="color:var(--target)">✕</span> target <span style="color:var(--accent)">◌</span> new target (not sent yet) <span style="color:var(--craft)">●</span> craft</div>
+    </section>
+    <section class="card">
+      <h2>Activity</h2>
+      <ul id="log"></ul>
+    </section>
+  </div>
+
+  <div class="stack">
+    <section class="card">
+      <h2>Status</h2>
+      <div><span class="chip off" id="modeChip">—</span> <span class="chip off" id="armChip">—</span> <span class="chip off" id="liveChip">offline</span></div>
+      <div class="status" id="statusText">Waiting for the craft…</div>
+      <div class="note" id="verText"></div>
+      <div class="stats">
+        <div class="stat"><span>Height (Y)</span><b id="sY">—</b></div>
+        <div class="stat"><span>Above ground</span><b id="sGround">—</b></div>
+        <div class="stat"><span>To target</span><b id="sDist">—</b></div>
+        <div class="stat"><span>Speed</span><b id="sSpeed">—</b></div>
+        <div class="stat"><span>Lean</span><b id="sTilt">—</b><div class="bar"><i id="tiltBar"></i></div></div>
+        <div class="stat"><span>Leveling</span><b id="sLevel" style="font-size:14px">—</b></div>
+        <div class="stat"><span>Position</span><b id="sPos" style="font-size:14px">—</b></div>
+        <div class="stat"><span>Updates today</span><b id="sSent">—</b></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Target</h2>
+      <div class="coords">
+        <label>X <input id="tx" inputmode="numeric"></label>
+        <label>Y <input id="ty" inputmode="numeric"></label>
+        <label>Z <input id="tz" inputmode="numeric"></label>
+      </div>
+      <div class="row">
+        <button class="primary" id="launchBtn">Launch</button>
+        <button id="retargetBtn">Change target</button>
+      </div>
+      <div class="sep"></div>
+      <h2>Flight</h2>
+      <div class="row">
+        <button id="holdBtn">Hold position</button>
+        <button id="homeBtn">Return to pad</button>
+        <button id="landBtn">Land here</button>
+        <button id="armBtn">Disarm</button>
+        <button id="pingBtn">Refresh</button>
+      </div>
+      <div class="sep"></div>
+      <div class="row"><button class="danger" id="cutBtn">Cut all power</button></div>
+      <p class="note">Cut all power turns every thruster off, so the craft falls. Return to pad and Land here always disarm first.</p>
+    </section>
+  </div>
+</main>
+
+<footer>
+  <p class="note">Messages go through the free <a href="https://ntfy.sh" style="color:var(--accent)">ntfy.sh</a> relay, which allows the craft's server about 250 updates a day, so the craft updates every few seconds while flying and on changes otherwise.
+  Anyone who knows the code can send commands, so keep it to yourself. Code and install: <a href="https://github.com/levisnakes/cc-gps-craft" style="color:var(--accent)">github.com/levisnakes/cc-gps-craft</a></p>
+</footer>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const RELAY = "https://ntfy.sh/";
+  let code = "", ws = null, last = null, lastAt = 0, trail = [], demo = null, reconnectTimer = null;
+  const store = {
+    get: k => { try { return localStorage.getItem(k); } catch { return null; } },
+    set: (k, v) => { try { localStorage.setItem(k, v); } catch {} },
+  };
+
+  // ---------- activity log ----------
+  function note(msg, strong) {
+    const li = document.createElement("li");
+    const t = new Date().toLocaleTimeString();
+    li.innerHTML = `${t} — ` + (strong ? `<b></b>` : "");
+    if (strong) li.querySelector("b").textContent = msg; else li.append(msg);
+    $("log").prepend(li);
+    while ($("log").children.length > 80) $("log").lastChild.remove();
+  }
+
+  // ---------- link ----------
+  function topic(kind) { return `gpscraft-${code}-${kind}`; }
+
+  function disconnect() {
+    clearTimeout(reconnectTimer);
+    if (ws) { ws.onclose = null; ws.close(); ws = null; }
+  }
+
+  async function connect() {
+    disconnect();
+    code = $("code").value.trim().toLowerCase();
+    if (!/^[a-z0-9]{4,16}$/.test(code)) { note("Enter the code shown on the craft's screen.", true); return; }
+    store.set("gpscraft-code", code);
+    trail = []; last = null; lastAt = 0; clearTarget();
+    $("linkText").textContent = "Connecting…";
+    // Recent history first, so the page fills in even if the craft is quiet.
+    try {
+      const r = await fetch(`${RELAY}${topic("tel")}/json?poll=1&since=12h`);
+      const lines = (await r.text()).split("\n").filter(Boolean);
+      for (const line of lines) {
+        const ev = JSON.parse(line);
+        if (ev.event === "message") receive(ev.message, ev.time * 1000, true);
+      }
+      if (lines.length) note(`Loaded ${lines.length} earlier update${lines.length === 1 ? "" : "s"}.`);
+    } catch (e) { note("Couldn't load history from ntfy.sh."); }
+    ws = new WebSocket(`wss://ntfy.sh/${topic("tel")}/ws`);
+    ws.onopen = () => { $("linkText").textContent = `Listening for craft ${code}`; note(`Connected to craft ${code}.`, true); send("ping", {}, true); };
+    ws.onmessage = e => { const ev = JSON.parse(e.data); if (ev.event === "message") receive(ev.message, Date.now()); };
+    ws.onclose = () => { $("linkText").textContent = "Link dropped, reconnecting…"; reconnectTimer = setTimeout(connect, 4000); };
+  }
+
+  async function send(c, extra = {}, quiet = false) {
+    const body = JSON.stringify({ c, ts: Date.now(), ...extra });
+    if (demo) { demo.command({ c, ...extra }); if (!quiet) note(`Sent: ${label(c, extra)}`, true); return; }
+    if (!code) { note("Connect to a craft first.", true); return; }
+    try {
+      const r = await fetch(RELAY + topic("cmd"), { method: "POST", body });
+      if (!r.ok) throw new Error(r.status);
+      if (!quiet) note(`Sent: ${label(c, extra)}`, true);
+    } catch (e) { note(`Couldn't send "${c}" (${e.message}).`, true); }
+  }
+
+  function label(c, e) {
+    const names = { launch: "Launch", target: "Change target", hold: "Hold position", resume: "Resume",
+      home: "Return to pad", land: "Land here", arm: "Arm", disarm: "Disarm", cut: "Cut all power", ping: "Refresh" };
+    return (names[c] || c) + (e.x !== undefined ? ` → ${e.x} ${e.y} ${e.z}` : "");
+  }
+
+  function receive(text, at, history) {
+    let t;
+    try { t = JSON.parse(text); } catch { return; }
+    if (!t || !t.m) return;
+    const prevMode = last && last.m;
+    last = t; lastAt = t.ts || at;
+    if (t.p) {
+      const p = { x: t.p[0], z: t.p[2] };
+      const prev = trail[trail.length - 1];
+      if (!prev || Math.hypot(prev.x - p.x, prev.z - p.z) > 0.5) trail.push(p);
+      if (trail.length > 600) trail.shift();
+    }
+    if (!history && prevMode && prevMode !== t.m) note(`Mode: ${t.m}`, true);
+    if (t.t && !$("tx").value) { $("tx").value = t.t[0]; $("ty").value = t.t[1]; $("tz").value = t.t[2]; }
+    render();
+  }
+
+  // ---------- rendering ----------
+  const fmt = (v, d = 0) => (v === undefined || v === null) ? "—" : Number(v).toFixed(d);
+
+  function render() {
+    const t = last;
+    const age = lastAt ? (Date.now() - lastAt) / 1000 : Infinity;
+    const live = $("liveChip");
+    if (!t) { live.className = "chip off"; live.textContent = "offline"; }
+    else if (age < 20) { live.className = "chip live"; live.textContent = `live · ${Math.max(0, age).toFixed(0)}s ago`; }
+    else { live.className = "chip stale"; live.textContent = `last heard ${age < 120 ? age.toFixed(0) + "s" : Math.round(age / 60) + " min"} ago`; }
+    if (t) {
+      $("modeChip").textContent = t.m; $("modeChip").className = "chip";
+      $("armChip").textContent = t.armed ? "ARMED" : "DISARMED";
+      $("armChip").className = "chip " + (t.armed ? "armed" : "safe");
+      $("statusText").textContent = t.s || "";
+      $("verText").textContent = `Craft software v${t.v}` + (t.hold ? " · holding position" : "");
+      $("sY").textContent = t.p ? fmt(t.p[1], 1) : "—";
+      $("sGround").textContent = t.ground !== undefined ? fmt(t.ground, 1) + " b" : "—";
+      const dist = (t.p && t.t) ? Math.hypot(t.t[0] - t.p[0], t.t[2] - t.p[2]) : null;
+      $("sDist").textContent = dist === null ? "—" : fmt(dist) + " b";
+      $("sSpeed").textContent = t.vel ? fmt(Math.hypot(t.vel[0], t.vel[2]), 1) + " b/s" : "—";
+      $("sTilt").textContent = t.tilt !== undefined ? t.tilt + "°" : "—";
+      const tb = $("tiltBar"); const tilt = t.tilt || 0;
+      tb.style.width = Math.min(100, tilt / 90 * 100) + "%";
+      tb.style.background = tilt < 15 ? "var(--good)" : tilt < 35 ? "var(--warn)" : "var(--bad)";
+      $("sLevel").textContent = t.lvl || "—";
+      $("sPos").textContent = t.p ? `${fmt(t.p[0])} ${fmt(t.p[1])} ${fmt(t.p[2])}` : "—";
+      $("sSent").textContent = t.sent !== undefined ? `${t.sent} / ${t.limit}` : "—";
+      $("armBtn").textContent = t.armed ? "Disarm" : "Arm";
+      $("holdBtn").textContent = t.hold ? "Resume" : "Hold position";
+    }
+    const flying = t && !["READY", "LANDED", "PAYLOAD"].includes(t.m);
+    const linked = !!(ws || demo);
+    $("launchBtn").disabled = !linked || (t && t.m !== "READY");
+    $("retargetBtn").disabled = !flying || t.m === "DESCEND";
+    for (const id of ["holdBtn", "homeBtn"]) $(id).disabled = !flying || t.m === "DESCEND";
+    $("landBtn").disabled = !flying;
+    $("armBtn").disabled = !t;
+    $("pingBtn").disabled = !linked;
+    $("cutBtn").disabled = !flying;
+    drawMap();
+  }
+
+  // ---------- map ----------
+  const cv = $("map"), cx = cv.getContext("2d");
+  let view = null;  // world -> canvas transform from the last draw
+
+  function drawMap() {
+    const css = getComputedStyle(document.documentElement);
+    const col = n => css.getPropertyValue(n).trim();
+    const W = cv.width, H = cv.height;
+    cx.clearRect(0, 0, W, H);
+    const pts = [...trail];
+    const t = last;
+    const tgt = t && t.t ? { x: t.t[0], z: t.t[2] } : null;   // where the craft is headed
+    let typed = inputTarget();                                  // typed or clicked, not sent yet
+    if (typed && tgt && Math.hypot(typed.x - tgt.x, typed.z - tgt.z) < 1) typed = null;
+    if (t && t.pad) pts.push({ x: t.pad[0], z: t.pad[2] });
+    if (t && t.p) pts.push({ x: t.p[0], z: t.p[2] });
+    if (tgt) pts.push(tgt);
+    if (typed) pts.push(typed);
+    if (!pts.length) pts.push({ x: 0, z: 0 });
+    let minX = Math.min(...pts.map(p => p.x)), maxX = Math.max(...pts.map(p => p.x));
+    let minZ = Math.min(...pts.map(p => p.z)), maxZ = Math.max(...pts.map(p => p.z));
+    const span = Math.max(maxX - minX, maxZ - minZ, 40) * 1.25;
+    const midX = (minX + maxX) / 2, midZ = (minZ + maxZ) / 2;
+    const scale = Math.min(W, H) / span;
+    view = { midX, midZ, scale, W, H };
+    const toC = p => [W / 2 + (p.x - midX) * scale, H / 2 + (p.z - midZ) * scale];
+
+    // grid every "nice" number of blocks
+    const step = [5, 10, 20, 50, 100, 200, 500, 1000].find(s => s * scale > 60) || 2000;
+    cx.strokeStyle = col("--line"); cx.lineWidth = 1; cx.fillStyle = col("--dim"); cx.font = "20px system-ui";
+    const x0 = Math.floor((midX - W / 2 / scale) / step) * step, z0 = Math.floor((midZ - H / 2 / scale) / step) * step;
+    for (let x = x0; x <= midX + W / 2 / scale; x += step) {
+      const [px] = toC({ x, z: 0 }); cx.beginPath(); cx.moveTo(px, 0); cx.lineTo(px, H); cx.stroke();
+      cx.fillText(x, px + 4, H - 8);
+    }
+    for (let z = z0; z <= midZ + H / 2 / scale; z += step) {
+      const [, pz] = toC({ x: 0, z }); cx.beginPath(); cx.moveTo(0, pz); cx.lineTo(W, pz); cx.stroke();
+      cx.fillText(z, 6, pz - 6);
+    }
+    // trail
+    if (trail.length > 1) {
+      cx.strokeStyle = col("--craft"); cx.globalAlpha = .45; cx.lineWidth = 3; cx.beginPath();
+      trail.forEach((p, i) => { const [a, b] = toC(p); i ? cx.lineTo(a, b) : cx.moveTo(a, b); });
+      cx.stroke(); cx.globalAlpha = 1;
+    }
+    // pad
+    if (t && t.pad) { const [a, b] = toC({ x: t.pad[0], z: t.pad[2] }); cx.fillStyle = col("--pad"); cx.fillRect(a - 9, b - 9, 18, 18); }
+    // target
+    if (tgt) {
+      const [a, b] = toC(tgt); cx.strokeStyle = col("--target"); cx.lineWidth = 4;
+      cx.beginPath(); cx.moveTo(a - 12, b - 12); cx.lineTo(a + 12, b + 12); cx.moveTo(a + 12, b - 12); cx.lineTo(a - 12, b + 12); cx.stroke();
+      cx.beginPath(); cx.arc(a, b, 3 * scale, 0, Math.PI * 2); cx.lineWidth = 1.5; cx.stroke();
+      if (t && t.p) {
+        const [c, d] = toC({ x: t.p[0], z: t.p[2] }); cx.setLineDash([8, 8]); cx.beginPath(); cx.moveTo(c, d); cx.lineTo(a, b); cx.stroke(); cx.setLineDash([]);
+      }
+    }
+    // typed target that hasn't been sent
+    if (typed) {
+      const [a, b] = toC(typed); cx.strokeStyle = col("--accent"); cx.lineWidth = 3; cx.setLineDash([6, 6]);
+      cx.beginPath(); cx.arc(a, b, 14, 0, Math.PI * 2); cx.stroke(); cx.setLineDash([]);
+    }
+    // craft
+    if (t && t.p) {
+      const [a, b] = toC({ x: t.p[0], z: t.p[2] });
+      cx.fillStyle = col("--craft"); cx.beginPath(); cx.arc(a, b, 11, 0, Math.PI * 2); cx.fill();
+      if (t.vel && Math.hypot(t.vel[0], t.vel[2]) > .3) {
+        const s = Math.hypot(t.vel[0], t.vel[2]);
+        cx.strokeStyle = col("--craft"); cx.lineWidth = 4; cx.beginPath(); cx.moveTo(a, b);
+        cx.lineTo(a + t.vel[0] / s * 34, b + t.vel[2] / s * 34); cx.stroke();
+      }
+    }
+    cx.fillStyle = col("--dim"); cx.fillText("N ↑", W - 50, 28);
+  }
+
+  function clearTarget() { for (const id of ["tx", "ty", "tz"]) $(id).value = ""; }
+
+  function inputTarget() {
+    const x = parseFloat($("tx").value), z = parseFloat($("tz").value);
+    return isFinite(x) && isFinite(z) ? { x, z } : null;
+  }
+
+  cv.addEventListener("click", e => {
+    if (!view) return;
+    const r = cv.getBoundingClientRect();
+    const px = (e.clientX - r.left) / r.width * view.W, pz = (e.clientY - r.top) / r.height * view.H;
+    $("tx").value = Math.round(view.midX + (px - view.W / 2) / view.scale);
+    $("tz").value = Math.round(view.midZ + (pz - view.H / 2) / view.scale);
+    if (!$("ty").value) $("ty").value = last && last.p ? Math.round(last.p[1]) : 64;
+    drawMap();
+  });
+  for (const id of ["tx", "ty", "tz"]) $(id).addEventListener("input", drawMap);
+
+  // ---------- buttons ----------
+  function targetArgs() {
+    const x = parseFloat($("tx").value), y = parseFloat($("ty").value), z = parseFloat($("tz").value);
+    if (![x, y, z].every(isFinite)) { note("Fill in the target X, Y and Z (or click the map).", true); return null; }
+    return { x, y, z };
+  }
+  $("connectBtn").onclick = () => { setDemo(false); connect(); };
+  $("code").addEventListener("keydown", e => { if (e.key === "Enter") $("connectBtn").click(); });
+  $("launchBtn").onclick = () => { const a = targetArgs(); if (a && confirm(`Launch at ${a.x} ${a.y} ${a.z}?`)) send("launch", a); };
+  $("retargetBtn").onclick = () => { const a = targetArgs(); if (a) send("target", a); };
+  $("holdBtn").onclick = () => send(last && last.hold ? "resume" : "hold");
+  $("homeBtn").onclick = () => send("home");
+  $("landBtn").onclick = () => send("land");
+  $("armBtn").onclick = () => send(last && last.armed ? "disarm" : "arm");
+  $("pingBtn").onclick = () => send("ping");
+  $("cutBtn").onclick = () => { if (confirm("Cut all power? The craft will fall.")) send("cut"); };
+  $("demo").onchange = e => setDemo(e.target.checked);
+
+  // ---------- demo: a pretend craft, no network ----------
+  function setDemo(on) {
+    $("demo").checked = on;
+    if (on && !demo) {
+      disconnect(); trail = []; last = null; clearTarget();
+      demo = makeDemo(); demo.report(); $("linkText").textContent = "Demo craft (nothing is sent anywhere)";
+      note("Demo mode: a pretend craft you can fly from this page.", true);
+    } else if (!on && demo) {
+      demo.stop(); demo = null; trail = []; last = null; $("linkText").textContent = "Not connected"; render();
+    }
+  }
+
+  function makeDemo() {
+    const c = { m: "READY", s: "Waiting for a target", x: 0, y: 64, z: 0, vx: 0, vy: 0, vz: 0, armed: true, hold: null,
+      pad: [0, 64, 0], t: null, tilt: 0, alt: 64 };
+    let lastT = performance.now(), sent = 0;
+    const tick = () => {
+      const now = performance.now(), dt = Math.min(.2, (now - lastT) / 1000); lastT = now;
+      const goal = c.hold || (c.t ? { x: c.t[0], z: c.t[2] } : { x: c.x, z: c.z });
+      if (c.m === "CLIMB") { c.alt = 120; c.s = "Climbing to 120"; if (c.y > 118) c.m = "CRUISE"; }
+      if (c.m === "CRUISE") {
+        const d = Math.hypot(goal.x - c.x, goal.z - c.z);
+        c.s = c.hold ? "Holding position (website)" : `${d.toFixed(0)} blocks to target`;
+        if (d < 3 && !c.hold) c.m = "DESCEND";
+      }
+      if (c.m === "DESCEND") {
+        const gy = c.armed ? (c.t ? c.t[1] : 60) : 64;
+        c.alt = gy - 5; c.s = c.armed ? "Dropping onto target" : "Landing";
+        if (c.y - gy < (c.armed ? 3 : 1)) { c.m = c.armed ? "PAYLOAD" : "LANDED"; c.s = c.armed ? "Sensor triggered - payload fired" : "Landed (disarmed)"; c.vx = c.vz = c.vy = 0; }
+      }
+      if (["CLIMB", "CRUISE", "DESCEND"].includes(c.m)) {
+        const ex = goal.x - c.x, ez = goal.z - c.z, d = Math.hypot(ex, ez);
+        const sp = Math.min(12, Math.sqrt(2 * 1.2 * d));
+        const wx = d > .1 ? ex / d * sp : 0, wz = d > .1 ? ez / d * sp : 0;
+        c.vx += (wx - c.vx) * Math.min(1, dt * 1.5); c.vz += (wz - c.vz) * Math.min(1, dt * 1.5);
+        c.vy += (Math.max(-5, Math.min(6, (c.alt - c.y) * .5)) - c.vy) * Math.min(1, dt * 2);
+        c.x += c.vx * dt; c.y += c.vy * dt; c.z += c.vz * dt;
+        c.tilt = Math.min(25, Math.round(Math.hypot(wx - c.vx, wz - c.vz) * 3 + Math.random() * 2));
+      }
+    };
+    const report = () => {
+      sent++;
+      receive(JSON.stringify({ v: "demo", m: c.m, s: c.s, armed: c.armed, hold: !!c.hold, sent, limit: 200, ts: Date.now(),
+        p: [+c.x.toFixed(1), +c.y.toFixed(1), +c.z.toFixed(1)], vel: [+c.vx.toFixed(1), +c.vy.toFixed(1), +c.vz.toFixed(1)],
+        t: c.t, pad: c.pad, tilt: c.tilt, lvl: c.m === "READY" ? "not calibrated yet" : "vector thruster",
+        ground: +(c.y - (c.m === "DESCEND" && c.armed && c.t ? c.t[1] : 64)).toFixed(1) }), Date.now());
+    };
+    const a = setInterval(tick, 50), b = setInterval(report, 1000);
+    return {
+      report,
+      stop() { clearInterval(a); clearInterval(b); },
+      command(k) {
+        const flying = ["CLIMB", "CRUISE", "DESCEND"].includes(c.m);
+        if (k.c === "launch" && c.m === "READY") { c.t = [k.x, k.y, k.z]; c.m = "CLIMB"; }
+        if (k.c === "target" && flying && c.m !== "DESCEND") c.t = [k.x, k.y, k.z];
+        if (k.c === "hold" && flying) c.hold = { x: c.x, z: c.z };
+        if (k.c === "resume") c.hold = null;
+        if (k.c === "home" && flying) { c.armed = false; c.hold = null; c.t = [0, 64, 0]; }
+        if (k.c === "land" && flying) { c.armed = false; c.hold = null; c.t = [Math.round(c.x), 64, Math.round(c.z)]; c.m = "DESCEND"; }
+        if (k.c === "arm") c.armed = true;
+        if (k.c === "disarm") c.armed = false;
+        if (k.c === "cut") { c.m = "LANDED"; c.s = "Power cut from the website"; c.vx = c.vz = 0; c.y = 64; }
+        report();
+      },
+    };
+  }
+
+  // ---------- start ----------
+  const saved = store.get("gpscraft-code");
+  const fromUrl = new URLSearchParams(location.hash.slice(1)).get("code");
+  if (fromUrl || saved) { $("code").value = fromUrl || saved; connect(); }
+  else { render(); note("Enter the code from the craft's screen, or tick Demo to try it out.", true); }
+  setInterval(render, 1000);
+})();
+</script>
+</body>
+</html>

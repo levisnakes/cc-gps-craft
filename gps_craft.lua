@@ -18,7 +18,7 @@
 -- the distance to the ground. When it's within DETONATE_DISTANCE, the side
 -- outputs fire. Hold Ctrl+T to abort; all outputs switch off.
 
-VERSION = "1.7.0"  -- startup.lua compares this with version.txt on GitHub
+VERSION = "1.8.0"  -- startup.lua compares this with version.txt on GitHub
 
 -- ======================== SETTINGS ===========================
 -- Updates replace this file. To keep your own values, put them in
@@ -79,6 +79,14 @@ MAX_TILT = 60
 -- until it's back under half.
 SIDE_CUT_TILT = 20
 
+-- Website control: https://levisnakes.github.io/cc-gps-craft/
+-- The craft shows a pairing code; type it into the website. Messages go
+-- through the free ntfy.sh relay, which allows 250 a day per IP address,
+-- shared by every computer on the Minecraft server.
+REMOTE = true
+TELEMETRY_SECONDS = 5     -- status update interval while flying
+REMOTE_DAILY_LIMIT = 200  -- stop sending updates after this many a day
+
 -- ===================== END OF SETTINGS =======================
 
 if fs and fs.exists("craft_settings.lua") then
@@ -95,7 +103,7 @@ local lastFix = 0
 local altTarget = CRUISE_Y
 local HOVER_POWER = 15 * CRAFT_WEIGHT_PN / LIFT_THRUST_PN
 local hover = HOVER_POWER
-local mode = "CLIMB"
+local mode = "READY"
 local thrustDir = {}   -- side -> unit vector it pushes the craft (ship frame on Sable)
 local sideAccel = {}   -- side -> blocks/s^2 at full power, from calibration
 local orient = nil     -- ship rotation quaternion on Sable, nil with GPS
@@ -106,6 +114,13 @@ local lever = nil      -- side push per unit of tip; set when all sides can leve
 local gravity = 9.81   -- blocks/s^2, read from aero.getGravity() on Sable
 local navSource = "GPS"
 local status = ""
+local pad, padY = nil, nil   -- launch point
+local armed = true           -- false: land instead of firing the payload
+local holdAt = nil           -- website "hold": stay over this point
+local landNow = false        -- website "land": descend where it is
+local remoteId = nil         -- website pairing code
+local remoteState = "off"
+local remoteSent = 0         -- updates sent today
 
 local function now()
   return os.epoch("utc") / 1000
@@ -154,13 +169,6 @@ local function askNumber(label)
     if n then return n end
     print("Enter a number.")
   end
-end
-
-local function getTarget(args)
-  local x, y, z = tonumber(args[1]), tonumber(args[2]), tonumber(args[3])
-  if x and y and z then return { x = x, y = y, z = z } end
-  print("Target coordinates")
-  return { x = askNumber("X"), y = askNumber("Y"), z = askNumber("Z") }
 end
 
 -- ---------- loops ----------
@@ -564,6 +572,16 @@ local function steer(tx, tz)
   driveSides(wx, wz, errX, errZ)
 end
 
+-- Steers to (tx, tz) unless the website asked it to hold position.
+local function steerTo(tx, tz)
+  if holdAt then
+    status = "Holding position (website)"
+    steer(holdAt.x, holdAt.z)
+  else
+    steer(tx, tz)
+  end
+end
+
 -- Pulses each side thruster and measures the change in velocity it caused,
 -- so the craft's facing doesn't matter. Opposite sides are pulsed back to
 -- back so the second pulse cancels the first one's drift.
@@ -714,9 +732,20 @@ end
 local function sensorLoop()
   while true do
     os.pullEvent()
-    if mode == "DESCEND" and shouldDetonate() then
-      firePayload()
-      return
+    if mode == "DESCEND" then
+      if armed and shouldDetonate() then
+        firePayload()
+        return
+      end
+      -- Disarmed: set down instead, cutting power once it's on the ground.
+      local d = sensorDistance()
+      local down = d and d <= 1.2 or not sensor and pos.y <= target.y
+      if not armed and down then
+        mode = "LANDED"
+        status = "Landed (disarmed)"
+        allOff()
+        return
+      end
     end
   end
 end
@@ -725,8 +754,7 @@ local function missionLoop()
   waitFix()
 
   mode = "CLIMB"
-  local pad = { x = pos.x, z = pos.z }
-  local padY = pos.y
+  pad, padY = { x = pos.x, z = pos.z }, pos.y
   altTarget = math.min(pos.y + CAL_HEIGHT, CRUISE_Y)
   while pos.y < altTarget - 2 do
     status = string.format("Climbing to %.0f to calibrate", altTarget)
@@ -754,9 +782,9 @@ local function missionLoop()
 
   mode = "CLIMB"
   altTarget = CRUISE_Y
-  while pos.y < CRUISE_Y - 2 do
+  while pos.y < CRUISE_Y - 2 and not landNow do
     status = string.format("Climbing to %d", CRUISE_Y)
-    steer(pad.x, pad.z)
+    steerTo(pad.x, pad.z)
     waitFix()
   end
 
@@ -764,22 +792,25 @@ local function missionLoop()
   -- A craft steering by leaning can end up circling just outside the radius,
   -- so close enough for 10 seconds also counts.
   local nearSince = nil
-  while horizontalDistance() > ARRIVE_RADIUS do
-    if horizontalDistance() < ARRIVE_RADIUS * 4 then
+  while (horizontalDistance() > ARRIVE_RADIUS or holdAt) and not landNow do
+    if holdAt then
+      nearSince = nil
+    elseif horizontalDistance() < ARRIVE_RADIUS * 4 then
       nearSince = nearSince or now()
       if now() - nearSince > 10 then break end
     else
       nearSince = nil
     end
-    status = string.format("%.0f blocks to target", horizontalDistance())
-    steer(target.x, target.z)
+    if not holdAt then status = string.format("%.0f blocks to target", horizontalDistance()) end
+    steerTo(target.x, target.z)
     waitFix()
   end
 
   mode = "DESCEND"
   while true do
     local d = sensorDistance()
-    status = string.format("Dropping onto target, ground %s", d and string.format("%.1f blocks", d) or "not in range")
+    status = string.format("%s, ground %s", armed and "Dropping onto target" or "Landing",
+      d and string.format("%.1f blocks", d) or "not in range")
     steer(target.x, target.z)
     waitFix()
   end
@@ -833,12 +864,205 @@ local function screenLoop()
       print(string.format("Tilt:   %.0f deg%s", tilt, cut and " - TIPPED, lift off" or ""))
       print("Level:  " .. lv)
     end
+    if REMOTE then
+      print(string.format("Website: code %s  %s%s", remoteId or "-", remoteState, armed and "" or "  DISARMED"))
+    end
     print("")
     print(status)
     print("")
     print("Ctrl+T to abort")
     sleep(0.25)
   end
+end
+
+-- ---------- website control ----------
+-- Commands arrive on ntfy.sh topic gpscraft-<code>-cmd over a websocket;
+-- status updates go out on gpscraft-<code>-tel. Anyone with the code can
+-- send commands, so treat it like a password.
+
+local pendingLaunch = nil
+local wantUpdate = false
+
+local function remoteTopic(kind)
+  return "gpscraft-" .. remoteId .. "-" .. kind
+end
+
+local function loadRemoteId()
+  local path = "craft_remote_id"
+  if fs.exists(path) then
+    local h = fs.open(path, "r")
+    local id = h.readAll():match("%w+")
+    h.close()
+    if id then return id end
+  end
+  math.randomseed(os.epoch("utc"))
+  local chars, id = "abcdefghjkmnpqrstuvwxyz23456789", ""
+  for _ = 1, 8 do
+    local i = math.random(1, #chars)
+    id = id .. chars:sub(i, i)
+  end
+  local h = fs.open(path, "w")
+  h.write(id)
+  h.close()
+  return id
+end
+
+-- Today's update count, kept in a file so a reboot doesn't reset it.
+local function countSent()
+  local today = os.date("!%Y-%m-%d")
+  local day, n = nil, 0
+  if fs.exists("craft_remote_count") then
+    local h = fs.open("craft_remote_count", "r")
+    day, n = h.readAll():match("(%S+)%s+(%d+)")
+    h.close()
+  end
+  return today, (day == today and tonumber(n) or 0)
+end
+
+local function round1(v) return math.floor(v * 10 + 0.5) / 10 end
+
+local function telemetry()
+  local t = {
+    v = VERSION, m = mode, s = status, armed = armed, hold = holdAt ~= nil,
+    sent = remoteSent + 1, limit = REMOTE_DAILY_LIMIT, ts = os.epoch("utc"),
+  }
+  if pos then
+    t.p = { round1(pos.x), round1(pos.y), round1(pos.z) }
+    t.tilt = math.floor(math.deg(math.acos(clamp(up.y, -1, 1))) + 0.5)
+    t.vel = { round1(vel.x), round1(vel.y), round1(vel.z) }
+  end
+  if target then t.t = { target.x, target.y, target.z } end
+  if pad then t.pad = { round1(pad.x), round1(padY), round1(pad.z) } end
+  local n = 0
+  for _ in pairs(sideAccel) do n = n + 1 end
+  t.lvl = nozzleTip and "vector thruster" or lever and "side thrusters"
+    or (n < #THRUST_SIDES and "not calibrated yet" or "off")
+  local d = sensorDistance()
+  if d then t.ground = round1(d) end
+  return t
+end
+
+local function sendUpdate()
+  local today, n = countSent()
+  remoteSent = n
+  if n >= REMOTE_DAILY_LIMIT then
+    remoteState = "daily update limit reached"
+    return false
+  end
+  local ok, res = pcall(http.post, "https://ntfy.sh/" .. remoteTopic("tel"), textutils.serializeJSON(telemetry()))
+  if ok and res then
+    res.close()
+    remoteSent = n + 1
+    local h = fs.open("craft_remote_count", "w")
+    h.write(today .. " " .. remoteSent)
+    h.close()
+    return true
+  end
+  return false
+end
+
+local function handleCommand(c)
+  local function point()
+    local x, y, z = tonumber(c.x), tonumber(c.y), tonumber(c.z)
+    if x and y and z then return { x = x, y = y, z = z } end
+  end
+  log("website: %s", c.c or "?")
+  local flying = mode ~= "READY" and mode ~= "LANDED" and mode ~= "PAYLOAD"
+  if c.c == "launch" then
+    if mode == "READY" and point() then pendingLaunch = point() end
+  elseif c.c == "target" then
+    if point() and flying and mode ~= "DESCEND" then
+      target = point()
+      status = "New target from website"
+    end
+  elseif c.c == "hold" then
+    if pos and flying and mode ~= "DESCEND" then holdAt = { x = pos.x, z = pos.z } end
+  elseif c.c == "resume" then
+    holdAt = nil
+  elseif c.c == "home" then
+    if pad and flying and mode ~= "DESCEND" then
+      -- Coming home always lands rather than firing.
+      armed, holdAt = false, nil
+      target = { x = pad.x, y = padY, z = pad.z }
+      status = "Returning to the launch pad"
+    end
+  elseif c.c == "land" then
+    if pos and flying then
+      armed, holdAt, landNow = false, nil, true
+      target = { x = pos.x, y = padY or pos.y - 256, z = pos.z }
+    end
+  elseif c.c == "disarm" then
+    armed = false
+  elseif c.c == "arm" then
+    armed = true
+  elseif c.c == "cut" then
+    error("Power cut from the website", 0)
+  end
+  wantUpdate = true  -- every command (including "ping") gets a fresh update
+end
+
+-- Listens for website commands, reconnecting if the link drops.
+local function remoteLoop()
+  while true do
+    remoteState = "connecting"
+    local ok, ws = pcall(http.websocket, "wss://ntfy.sh/" .. remoteTopic("cmd") .. "/ws")
+    if ok and ws then
+      remoteState = "connected"
+      wantUpdate = true
+      while true do
+        -- ntfy sends a keepalive about every 45 s, so a minute of silence
+        -- means the link is gone.
+        local ok2, msg = pcall(ws.receive, 60)
+        if not ok2 or not msg then break end
+        local ev = textutils.unserializeJSON(msg)
+        if type(ev) == "table" and ev.event == "message" and ev.message then
+          local c = textutils.unserializeJSON(ev.message)
+          -- Ignore stale commands (over a minute old).
+          if type(c) == "table" and (not c.ts or math.abs(os.epoch("utc") - c.ts) < 60000) then
+            handleCommand(c)
+          end
+        end
+      end
+      pcall(ws.close)
+    end
+    remoteState = "offline, retrying"
+    sleep(10)
+  end
+end
+
+-- Sends status updates: right away when something changes, every
+-- TELEMETRY_SECONDS while flying, and when the website asks.
+local function telemetryLoop()
+  local lastSent, lastShape = -math.huge, nil
+  while true do
+    local shape = mode .. status:gsub("[%d%.]+", "#") .. tostring(armed) .. tostring(holdAt ~= nil)
+    local flying = mode ~= "READY" and mode ~= "LANDED" and mode ~= "PAYLOAD"
+    local due = wantUpdate
+      or (shape ~= lastShape and now() - lastSent > 2)
+      or (flying and now() - lastSent > TELEMETRY_SECONDS)
+    if due and remoteState == "connected" then
+      wantUpdate = false
+      if sendUpdate() then lastSent, lastShape = now(), shape end
+    end
+    sleep(0.5)
+  end
+end
+
+-- Waits for target coordinates from the keyboard or the website.
+local function waitForTarget()
+  if REMOTE then
+    print("Website code: " .. remoteId)
+    print("Type the target, or launch from the website.")
+  end
+  print("Target coordinates")
+  local typed = nil
+  parallel.waitForAny(
+    function() typed = { x = askNumber("X"), y = askNumber("Y"), z = askNumber("Z") } end,
+    function() while not pendingLaunch do os.pullEvent() end end)
+  if typed then return typed, false end
+  print("")
+  print(string.format("Launched from the website: %s %s %s", pendingLaunch.x, pendingLaunch.y, pendingLaunch.z))
+  return pendingLaunch, true
 end
 
 -- ---------- main ----------
@@ -867,22 +1091,48 @@ sensor = peripheral.find("optical_sensor")
 if not sensor then
   print("No Optical Sensor found; using redstone on " .. SENSOR_SIDE .. " instead.")
 end
-target = getTarget(args)
-local warn = liftWarning()
-if warn then
-  print(warn)
-  if LIFT_THRUST_PN <= CRAFT_WEIGHT_PN then return end
-  print("Press any key to launch anyway, Ctrl+T to cancel.")
-  os.pullEvent("key")
-end
-
-allOff()
-local navLoop = onSable and sableLoop or gpsLoop
+REMOTE = REMOTE and http ~= nil and http.websocket ~= nil
+if REMOTE then remoteId = loadRemoteId() end
 if fs then logFile = fs.open("craft.log", "w") end
 logStart = now()
-log("GPS Craft v%s  target %s %s %s  nav %s  vector thruster %s", VERSION, target.x, target.y, target.z,
-  navSource, nozzle and "yes" or "no")
-local ok, err = pcall(parallel.waitForAny, navLoop, altitudeLoop, missionLoop, sensorLoop, screenLoop, logLoop)
+
+local function program()
+  local remoteLaunch = false
+  local x, y, z = tonumber(args[1]), tonumber(args[2]), tonumber(args[3])
+  if x and y and z then
+    target = { x = x, y = y, z = z }
+  else
+    target, remoteLaunch = waitForTarget()
+  end
+  local warn = liftWarning()
+  if warn then
+    print(warn)
+    if LIFT_THRUST_PN <= CRAFT_WEIGHT_PN then return end
+    if not remoteLaunch then
+      print("Press any key to launch anyway, Ctrl+T to cancel.")
+      os.pullEvent("key")
+    end
+  end
+  allOff()
+  mode = "CLIMB"
+  log("GPS Craft v%s  target %s %s %s  nav %s  vector thruster %s", VERSION, target.x, target.y, target.z,
+    navSource, nozzle and "yes" or "no")
+  local navLoop = onSable and sableLoop or gpsLoop
+  parallel.waitForAny(navLoop, altitudeLoop, missionLoop, sensorLoop, screenLoop, logLoop)
+  allOff()
+  -- Stay online a moment so the website sees how it ended.
+  if REMOTE and remoteState == "connected" then
+    wantUpdate = true
+    sleep(3)
+  end
+end
+
+local ok, err
+if REMOTE then
+  ok, err = pcall(parallel.waitForAny, program, remoteLoop, telemetryLoop)
+else
+  ok, err = pcall(program)
+end
 log("stopped: %s", ok and mode or tostring(err))
 if logFile then logFile.close() end
 allOff()
@@ -890,6 +1140,8 @@ term.clear()
 term.setCursorPos(1, 1)
 if mode == "PAYLOAD" then
   print("Payload fired.")
+elseif mode == "LANDED" then
+  print("Landed.")
 elseif not ok then
   print("Stopped: " .. tostring(err))
 end

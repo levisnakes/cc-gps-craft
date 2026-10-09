@@ -13,6 +13,14 @@ On a Sable ship it watches how far the craft is leaning and holds it level.
 
 Put the lift thruster as close to under the center of mass as you can, especially without a vector thruster. Without nozzle leveling, the lift cuts out past MAX_TILT (60°) instead of driving the craft into the ground. Side thrusters ease off as the craft leans and stop at SIDE_CUT_TILT (20°), until the craft is back under half that.
 
+## Website control
+
+**https://levisnakes.github.io/cc-gps-craft/**
+
+The craft's screen shows a website code (it's saved in `craft_remote_id`, so it stays the same). Type it into the website to see the craft on a map and send it commands: launch at coordinates (or click the map), change target, hold position, return to the pad, land where it is, arm/disarm, and cut all power. Return to pad and Land here always disarm first, so it sets down instead of firing. Tick **Demo** on the website to try it with a pretend craft.
+
+Messages go through the free ntfy.sh relay. It allows about 250 messages a day per IP address, and every computer on a Minecraft server shares one, so the craft sends an update every TELEMETRY_SECONDS while flying, on changes otherwise, and stops at REMOTE_DAILY_LIMIT (200) a day. Receiving commands doesn't count. Anyone with the code can control the craft, so keep it private (delete `craft_remote_id` for a new one). Set `REMOTE = false` in craft_settings.lua to turn it off.
+
 ## Flight log
 
 Every flight writes `craft.log` on the computer: the calibration results, then the height, lean, nozzle aim and every thruster output five times a second. To share it, run `pastebin put craft.log` and send the link it prints.
