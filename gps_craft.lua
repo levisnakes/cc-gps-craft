@@ -18,7 +18,10 @@ SENSOR_SIDE = "top"
 THRUST_SIDES = { "front", "back", "left", "right" }
 
 CRUISE_Y = 200          -- altitude to fly at
-HOVER_POWER = 8         -- starting guess for the lift strength that holds altitude; corrected in flight
+-- Read these off the craft (goggles on the ship and the lift thruster).
+-- Hover power is worked out from them and fine-tuned in flight.
+CRAFT_WEIGHT_PN = 55    -- total weight of the craft
+LIFT_THRUST_PN = 66     -- lift thruster output at full power (redstone 15)
 MAX_CLIMB = 6           -- max climb/sink speed while changing altitude (blocks per second)
 ARRIVE_RADIUS = 3       -- blocks from target X/Z counted as "over the target"
 DESCENT_SPEED = 5       -- blocks per second while dropping onto the target
@@ -52,6 +55,7 @@ local target = nil
 local pos, vel = nil, { x = 0, y = 0, z = 0 }
 local lastFix = 0
 local altTarget = CRUISE_Y
+local HOVER_POWER = 15 * CRAFT_WEIGHT_PN / LIFT_THRUST_PN
 local hover = HOVER_POWER
 local mode = "CLIMB"
 local thrustDir = {}   -- side -> unit {x, z} it pushes the craft
@@ -104,6 +108,16 @@ end
 -- ---------- loops ----------
 
 -- Keeps pos/vel up to date from GPS and announces each fix with a "fix" event.
+-- Thrust needs some headroom over weight to climb and to correct drops.
+local function liftWarning()
+  local ratio = LIFT_THRUST_PN / CRAFT_WEIGHT_PN
+  if ratio <= 1 then
+    return "Lift thrust is not more than the weight - it can't take off."
+  elseif ratio < 1.5 then
+    return string.format("Lift is only %.1fx the weight: slow climb. 2x is better.", ratio)
+  end
+end
+
 local function gpsLoop()
   while true do
     local x, y, z = gps.locate(0.5)
@@ -329,6 +343,13 @@ if not sensor then
   print("No Optical Sensor found; using redstone on " .. SENSOR_SIDE .. " instead.")
 end
 target = getTarget(args)
+local warn = liftWarning()
+if warn then
+  print(warn)
+  if LIFT_THRUST_PN <= CRAFT_WEIGHT_PN then return end
+  print("Press any key to launch anyway, Ctrl+T to cancel.")
+  os.pullEvent("key")
+end
 
 allOff()
 local ok, err = pcall(parallel.waitForAny, gpsLoop, altitudeLoop, missionLoop, sensorLoop, screenLoop)
