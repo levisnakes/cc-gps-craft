@@ -1,4 +1,8 @@
--- GPS Craft: flies a redstone-thruster craft to a target using the gps API.
+-- GPS Craft: flies a redstone-thruster craft to a target.
+--
+-- On a Sable ship (CC: Sable installed) it reads the ship's exact position,
+-- rotation and speed every tick through the `sublevel` API. Otherwise it
+-- falls back to the gps API, which needs a wireless modem and GPS hosts.
 --
 -- Usage:  gps_craft <x> <y> <z>      or just  gps_craft  and type them in.
 --
@@ -44,7 +48,13 @@ PAYLOAD_SECONDS = 2
 ALT_P = 0.5             -- how hard it chases the target altitude
 SPEED_GAIN = 2.0        -- lift change per block/s of vertical speed error
 ALT_I = 0.4             -- how fast it learns the real hover power
-POS_P, POS_D = 0.4, 1.5
+MAX_SPEED = 20          -- top horizontal speed (blocks per second)
+-- Braking uses this fraction of the side thrusters' measured strength, so it
+-- starts slowing down early enough. Lower it if it still overshoots.
+BRAKE_MARGIN = 0.5
+-- Seconds a full-power side thruster gets to fix a speed error. Lower is
+-- snappier, higher is gentler.
+RESPONSE_TIME = 0.5
 CAL_PULSE = 1.5         -- seconds per calibration pulse
 
 -- ===================== END OF SETTINGS =======================
@@ -58,7 +68,10 @@ local altTarget = CRUISE_Y
 local HOVER_POWER = 15 * CRAFT_WEIGHT_PN / LIFT_THRUST_PN
 local hover = HOVER_POWER
 local mode = "CLIMB"
-local thrustDir = {}   -- side -> unit {x, z} it pushes the craft
+local thrustDir = {}   -- side -> unit vector it pushes the craft (ship frame on Sable)
+local sideAccel = {}   -- side -> blocks/s^2 at full power, from calibration
+local orient = nil     -- ship rotation quaternion on Sable, nil with GPS
+local navSource = "GPS"
 local status = ""
 
 local function now()
@@ -107,7 +120,6 @@ end
 
 -- ---------- loops ----------
 
--- Keeps pos/vel up to date from GPS and announces each fix with a "fix" event.
 -- Thrust needs some headroom over weight to climb and to correct drops.
 local function liftWarning()
   local ratio = LIFT_THRUST_PN / CRAFT_WEIGHT_PN
@@ -118,6 +130,55 @@ local function liftWarning()
   end
 end
 
+-- Rotate vector v by quaternion q (or by its inverse).
+local function rotate(q, v, inverse)
+  local qx, qy, qz, qw = q.x, q.y, q.z, q.w
+  if inverse then qx, qy, qz = -qx, -qy, -qz end
+  local tx = 2 * (qy * v.z - qz * v.y)
+  local ty = 2 * (qz * v.x - qx * v.z)
+  local tz = 2 * (qx * v.y - qy * v.x)
+  return {
+    x = v.x + qw * tx + (qy * tz - qz * ty),
+    y = v.y + qw * ty + (qz * tx - qx * tz),
+    z = v.z + qw * tz + (qx * ty - qy * tx),
+  }
+end
+
+-- Thruster push direction in world space right now.
+local function worldDir(side)
+  local d = thrustDir[side]
+  if not d then return nil end
+  if orient then return rotate(orient, d) end
+  return d
+end
+
+-- Reads the ship's pose every tick. Velocity comes from the change in
+-- position (smoothed), which works whatever units Sable reports speed in.
+local function sableLoop()
+  while true do
+    local ok, pose = pcall(sublevel.getLogicalPose)
+    if ok and pose then
+      local p, t = pose.position, now()
+      if pos and t > lastFix then
+        local dt = t - lastFix
+        local a = 0.5
+        vel = {
+          x = vel.x * (1 - a) + (p.x - pos.x) / dt * a,
+          y = vel.y * (1 - a) + (p.y - pos.y) / dt * a,
+          z = vel.z * (1 - a) + (p.z - pos.z) / dt * a,
+        }
+      end
+      pos, orient, lastFix = { x = p.x, y = p.y, z = p.z }, pose.orientation, t
+      os.queueEvent("fix")
+    else
+      status = "Lost the ship pose - holding hover power"
+      setThrust(LIFT_SIDE, hover)
+    end
+    sleep(0)
+  end
+end
+
+-- Keeps pos/vel up to date from GPS and announces each fix with a "fix" event.
 local function gpsLoop()
   while true do
     local x, y, z = gps.locate(0.5)
@@ -172,13 +233,32 @@ local function waitSeconds(s)
   while now() < untilT do waitFix() end
 end
 
--- Steers toward (tx, tz) by projecting the desired push onto each thruster.
+-- Steers toward (tx, tz). It picks the speed it wants from the distance
+-- left, capped so it can always brake in time (v = sqrt(2 * a * d) using
+-- the weakest thruster's measured strength), then fires each side thruster
+-- in proportion to how much it helps close the gap to that speed.
 local function steer(tx, tz)
-  local fx = POS_P * (tx - pos.x) - POS_D * vel.x
-  local fz = POS_P * (tz - pos.z) - POS_D * vel.z
+  local ex, ez = tx - pos.x, tz - pos.z
+  local dist = math.sqrt(ex * ex + ez * ez)
+
+  local brake = math.huge
+  for _, a in pairs(sideAccel) do brake = math.min(brake, a) end
+  if brake == math.huge then brake = 1 end
+  brake = brake * BRAKE_MARGIN
+
+  local wantVx, wantVz = 0, 0
+  if dist > 0.05 then
+    local speed = math.min(MAX_SPEED, math.sqrt(2 * brake * dist))
+    wantVx, wantVz = ex / dist * speed, ez / dist * speed
+  end
+  local errX, errZ = wantVx - vel.x, wantVz - vel.z
+
   for _, side in ipairs(THRUST_SIDES) do
-    local d = thrustDir[side]
-    local push = d and (fx * d.x + fz * d.z) or 0
+    local d = worldDir(side)
+    local push = 0
+    if d and sideAccel[side] then
+      push = (errX * d.x + errZ * d.z) / (sideAccel[side] * RESPONSE_TIME)
+    end
     setThrust(side, push > 0 and push * 15 or 0)
   end
 end
@@ -198,6 +278,7 @@ local function calibrate()
     status = "Calibrating " .. side
     waitSeconds(0.3)
     local v0 = { x = vel.x, z = vel.z }
+    local t0 = now()
     setThrust(side, 15)
     waitSeconds(CAL_PULSE)
     setThrust(side, 0)
@@ -206,7 +287,10 @@ local function calibrate()
     if len < 0.05 then
       error("Side '" .. side .. "' didn't move the craft during calibration", 0)
     end
-    thrustDir[side] = { x = dx / len, z = dz / len }
+    sideAccel[side] = len / (now() - t0)
+    local dir = { x = dx / len, y = 0, z = dz / len }
+    -- On Sable, store it in the ship's own frame so turning mid-flight is handled.
+    thrustDir[side] = orient and rotate(orient, dir, true) or dir
   end
   -- Brake any leftover drift before cruising
   status = "Calibrating: settling"
@@ -321,7 +405,7 @@ local function screenLoop()
     else
       print(string.format("Sensor: redstone %d  (fires at %d)", rs.getAnalogInput(SENSOR_SIDE), TRIGGER_STRENGTH))
     end
-    print(string.format("Lift:   hover power %.1f", hover))
+    print(string.format("Lift:   hover power %.1f   Nav: %s", hover, navSource))
     print("")
     print(status)
     print("")
@@ -335,8 +419,11 @@ end
 local args = { ... }
 term.clear()
 term.setCursorPos(1, 1)
-if not peripheral.find("modem", function(_, m) return m.isWireless() end) then
-  error("No wireless modem: the craft needs one for GPS", 0)
+local onSable = sublevel ~= nil and sublevel.isInPlotGrid()
+if onSable then
+  navSource = "Sable"
+elseif not peripheral.find("modem", function(_, m) return m.isWireless() end) then
+  error("Not on a Sable ship and no wireless modem for GPS", 0)
 end
 sensor = peripheral.find("optical_sensor")
 if not sensor then
@@ -352,7 +439,8 @@ if warn then
 end
 
 allOff()
-local ok, err = pcall(parallel.waitForAny, gpsLoop, altitudeLoop, missionLoop, sensorLoop, screenLoop)
+local navLoop = onSable and sableLoop or gpsLoop
+local ok, err = pcall(parallel.waitForAny, navLoop, altitudeLoop, missionLoop, sensorLoop, screenLoop)
 allOff()
 term.clear()
 term.setCursorPos(1, 1)
