@@ -1,0 +1,272 @@
+-- GPS Craft: flies a redstone-thruster craft to a target using the gps API.
+--
+-- Usage:  gps_craft <x> <y> <z>      or just  gps_craft  and type them in.
+--
+-- Flight plan:
+--   1. CLIMB      lift thruster (LIFT_SIDE) climbs to CRUISE_Y
+--   2. CALIBRATE  pulses each side thruster once to learn which way it pushes
+--   3. CRUISE     flies level to the target X/Z
+--   4. DESCEND    drops toward the target Y and holds position
+-- Once within ARM_DISTANCE of the target, a strength-14 signal on SENSOR_SIDE
+-- fires the payload. Hold Ctrl+T to abort; all outputs switch off.
+
+-- ======================== SETTINGS ===========================
+
+LIFT_SIDE = "bottom"
+SENSOR_SIDE = "top"
+THRUST_SIDES = { "front", "back", "left", "right" }
+
+CRUISE_Y = 200          -- altitude to fly at
+HOVER_POWER = 8         -- lift strength (0-15) that roughly holds altitude
+ARRIVE_RADIUS = 3       -- blocks from target X/Z counted as "over the target"
+ARM_DISTANCE = 30       -- sensor is ignored until this close (stops launch-pad triggers)
+TRIGGER_STRENGTH = 14
+
+-- Payload outputs, fired together when the sensor triggers. By default these are
+-- the side faces (the thrusters shut off first). To use dedicated outputs,
+-- put a Redstone Relay on the network and set PAYLOAD_RELAY to its name.
+PAYLOAD_SIDES = { "front", "back", "left", "right" }
+PAYLOAD_RELAY = nil     -- e.g. "redstone_relay_0"
+PAYLOAD_SECONDS = 2
+
+-- Controller tuning. Raise the P values if it's sluggish, raise D if it overshoots.
+ALT_P, ALT_D = 0.8, 2.0
+POS_P, POS_D = 0.4, 1.5
+CAL_PULSE = 1.0         -- seconds per calibration pulse
+
+-- ===================== END OF SETTINGS =======================
+
+local ALL_SIDES = { "top", "bottom", "left", "right", "front", "back" }
+
+local target = nil
+local pos, vel = nil, { x = 0, y = 0, z = 0 }
+local lastFix = 0
+local altTarget = CRUISE_Y
+local mode = "CLIMB"
+local thrustDir = {}   -- side -> unit {x, z} it pushes the craft
+local status = ""
+
+local function now()
+  return os.epoch("utc") / 1000
+end
+
+local function clamp(v, lo, hi)
+  if v < lo then return lo elseif v > hi then return hi end
+  return v
+end
+
+local function allOff()
+  for _, side in ipairs(ALL_SIDES) do rs.setAnalogOutput(side, 0) end
+  if PAYLOAD_RELAY and peripheral.isPresent(PAYLOAD_RELAY) then
+    for _, side in ipairs(ALL_SIDES) do
+      pcall(peripheral.call, PAYLOAD_RELAY, "setAnalogOutput", side, 0)
+    end
+  end
+end
+
+local function setThrust(side, power)
+  rs.setAnalogOutput(side, math.floor(clamp(power, 0, 15) + 0.5))
+end
+
+local function horizontalOff()
+  for _, side in ipairs(THRUST_SIDES) do setThrust(side, 0) end
+end
+
+-- ---------- target input ----------
+
+local function askNumber(label)
+  while true do
+    write(label .. ": ")
+    local n = tonumber(read())
+    if n then return n end
+    print("Enter a number.")
+  end
+end
+
+local function getTarget(args)
+  local x, y, z = tonumber(args[1]), tonumber(args[2]), tonumber(args[3])
+  if x and y and z then return { x = x, y = y, z = z } end
+  print("Target coordinates")
+  return { x = askNumber("X"), y = askNumber("Y"), z = askNumber("Z") }
+end
+
+-- ---------- loops ----------
+
+-- Keeps pos/vel up to date from GPS and announces each fix with a "fix" event.
+local function gpsLoop()
+  while true do
+    local x, y, z = gps.locate(0.5)
+    if x then
+      local t = now()
+      if pos and t > lastFix then
+        local dt = t - lastFix
+        vel = { x = (x - pos.x) / dt, y = (y - pos.y) / dt, z = (z - pos.z) / dt }
+      end
+      pos, lastFix = { x = x, y = y, z = z }, t
+      os.queueEvent("fix")
+    else
+      status = "NO GPS FIX - holding hover power"
+      setThrust(LIFT_SIDE, HOVER_POWER)
+      sleep(0.2)
+    end
+  end
+end
+
+-- Holds altTarget with a PD controller on the lift thruster.
+local function altitudeLoop()
+  while true do
+    os.pullEvent("fix")
+    local err = altTarget - pos.y
+    setThrust(LIFT_SIDE, HOVER_POWER + ALT_P * err - ALT_D * vel.y)
+  end
+end
+
+local function waitFix()
+  os.pullEvent("fix")
+  return pos
+end
+
+local function waitSeconds(s)
+  local untilT = now() + s
+  while now() < untilT do waitFix() end
+end
+
+-- Steers toward (tx, tz) by projecting the desired push onto each thruster.
+local function steer(tx, tz)
+  local fx = POS_P * (tx - pos.x) - POS_D * vel.x
+  local fz = POS_P * (tz - pos.z) - POS_D * vel.z
+  for _, side in ipairs(THRUST_SIDES) do
+    local d = thrustDir[side]
+    local push = d and (fx * d.x + fz * d.z) or 0
+    setThrust(side, push > 0 and push * 15 or 0)
+  end
+end
+
+-- Pulses each side thruster and measures the change in velocity it caused,
+-- so the craft's facing doesn't matter. Opposite sides are pulsed back to
+-- back so the second pulse cancels the first one's drift.
+local function calibrate()
+  for _, side in ipairs({ "front", "back", "left", "right" }) do
+    status = "Calibrating " .. side
+    waitSeconds(0.3)
+    local v0 = { x = vel.x, z = vel.z }
+    setThrust(side, 15)
+    waitSeconds(CAL_PULSE)
+    setThrust(side, 0)
+    local dx, dz = vel.x - v0.x, vel.z - v0.z
+    local len = math.sqrt(dx * dx + dz * dz)
+    if len < 0.1 then
+      error("Side '" .. side .. "' didn't move the craft during calibration", 0)
+    end
+    thrustDir[side] = { x = dx / len, z = dz / len }
+  end
+  -- Brake any leftover drift before cruising
+  status = "Calibrating: settling"
+  local hold = { x = pos.x, z = pos.z }
+  local untilT = now() + 3
+  while now() < untilT do
+    steer(hold.x, hold.z)
+    waitFix()
+  end
+end
+
+local function horizontalDistance()
+  local dx, dz = target.x - pos.x, target.z - pos.z
+  return math.sqrt(dx * dx + dz * dz)
+end
+
+local function firePayload()
+  mode = "PAYLOAD"
+  status = "Sensor triggered - payload fired"
+  horizontalOff()
+  if PAYLOAD_RELAY then
+    for _, side in ipairs(PAYLOAD_SIDES) do
+      peripheral.call(PAYLOAD_RELAY, "setAnalogOutput", side, 15)
+    end
+  else
+    for _, side in ipairs(PAYLOAD_SIDES) do rs.setAnalogOutput(side, 15) end
+  end
+  sleep(PAYLOAD_SECONDS)
+end
+
+-- Fires the payload when armed and the sensor reads TRIGGER_STRENGTH.
+local function sensorLoop()
+  while true do
+    os.pullEvent()
+    if pos and target and horizontalDistance() <= ARM_DISTANCE
+        and rs.getAnalogInput(SENSOR_SIDE) == TRIGGER_STRENGTH then
+      firePayload()
+      return
+    end
+  end
+end
+
+local function missionLoop()
+  waitFix()
+
+  mode = "CLIMB"
+  altTarget = CRUISE_Y
+  while pos.y < CRUISE_Y - 2 do
+    status = string.format("Climbing to %d", CRUISE_Y)
+    waitFix()
+  end
+
+  mode = "CALIBRATE"
+  calibrate()
+
+  mode = "CRUISE"
+  while horizontalDistance() > ARRIVE_RADIUS do
+    status = string.format("%.0f blocks to target", horizontalDistance())
+    steer(target.x, target.z)
+    waitFix()
+  end
+
+  mode = "DESCEND"
+  altTarget = target.y
+  while true do
+    status = string.format("Over target, altitude %.0f -> %d", pos.y, target.y)
+    steer(target.x, target.z)
+    waitFix()
+  end
+end
+
+local function screenLoop()
+  while true do
+    term.clear()
+    term.setCursorPos(1, 1)
+    print("GPS Craft  [" .. mode .. "]")
+    print("")
+    print(string.format("Target: %d %d %d", target.x, target.y, target.z))
+    if pos then
+      print(string.format("Pos:    %.1f %.1f %.1f", pos.x, pos.y, pos.z))
+      print(string.format("Dist:   %.1f", horizontalDistance()))
+    end
+    print(string.format("Sensor: %d  (fires at %d)", rs.getAnalogInput(SENSOR_SIDE), TRIGGER_STRENGTH))
+    print("")
+    print(status)
+    print("")
+    print("Ctrl+T to abort")
+    sleep(0.25)
+  end
+end
+
+-- ---------- main ----------
+
+local args = { ... }
+term.clear()
+term.setCursorPos(1, 1)
+if not peripheral.find("modem", function(_, m) return m.isWireless() end) then
+  error("No wireless modem: the craft needs one for GPS", 0)
+end
+target = getTarget(args)
+
+allOff()
+local ok, err = pcall(parallel.waitForAny, gpsLoop, altitudeLoop, missionLoop, sensorLoop, screenLoop)
+allOff()
+term.clear()
+term.setCursorPos(1, 1)
+if mode == "PAYLOAD" then
+  print("Payload fired.")
+elseif not ok then
+  print("Stopped: " .. tostring(err))
+end
