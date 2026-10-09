@@ -18,7 +18,7 @@
 -- the distance to the ground. When it's within DETONATE_DISTANCE, the side
 -- outputs fire. Hold Ctrl+T to abort; all outputs switch off.
 
-VERSION = "1.6.0"  -- startup.lua compares this with version.txt on GitHub
+VERSION = "1.7.0"  -- startup.lua compares this with version.txt on GitHub
 
 -- ======================== SETTINGS ===========================
 -- Updates replace this file. To keep your own values, put them in
@@ -287,6 +287,17 @@ local function aimNozzle(ax, ay)
   if nozzle then pcall(nozzle.setVector, lastAim.x, lastAim.y) end
 end
 
+-- The nozzle only takes steps of 1/15. Carrying each tick's rounding error
+-- into the next lets the in-between values average out, since the nozzle
+-- itself smooths over a few ticks.
+local ditherErr = { x = 0, y = 0 }
+local function dither(axis, v)
+  local want = clamp(v, -1, 1) + ditherErr[axis]
+  local q = clamp(math.floor(want * 15 + 0.5) / 15, -1, 1)
+  ditherErr[axis] = clamp(want - q, -1 / 15, 1 / 15)
+  return q
+end
+
 local function levelNozzle()
   local t = now()
   local dt = lastLevel and math.min(t - lastLevel, 0.5) or 0
@@ -307,52 +318,96 @@ local function levelNozzle()
   -- Mix the two aim axes to get that tip.
   local det = a.x * b.z - a.z * b.x
   if math.abs(det) < 1e-9 then return end
-  aimNozzle((wantX * b.z - wantZ * b.x) / det, (a.x * wantZ - a.z * wantX) / det)
+  aimNozzle(dither("x", (wantX * b.z - wantZ * b.x) / det), dither("y", (a.x * wantZ - a.z * wantX) / det))
 end
 
--- Aims the nozzle one way and measures how fast the craft starts to lean,
--- per unit of aim.
-local function pulseNozzle(axis, aim)
-  aimNozzle(0, 0)
-  local b0, bt = { x = upRate.x, z = upRate.z }, now()
-  waitSeconds(0.3)
-  local base = now() - bt
-  local driftX, driftZ = (upRate.x - b0.x) / base, (upRate.z - b0.z) / base
-  local r0, u0, t0 = { x = upRate.x, z = upRate.z }, { x = up.x, z = up.z }, now()
-  if axis == "x" then aimNozzle(aim, 0) else aimNozzle(0, aim) end
-  while now() - t0 < CAL_PULSE
-      and (now() - t0 < 0.3 or (up.x - u0.x) ^ 2 + (up.z - u0.z) ^ 2 < 0.0075) do
+-- Where the nozzle really points (it swings 20% of the way per tick).
+local function actualAim(axis)
+  local ok, v = pcall(axis == "x" and nozzle.getVectorX or nozzle.getVectorY)
+  if ok and type(v) == "number" then return v end
+  return axis == "x" and lastAim.x or lastAim.y
+end
+
+-- Tests one nozzle axis with a doublet: aim one way until the craft starts
+-- turning, then the other way until it stops, then center. That leaves the
+-- craft about as level as it started. A strong vector thruster tips a
+-- Sable ship very fast and nothing slows the spin down, so the aims start at
+-- the smallest step (1/15) and only grow if the craft barely reacts.
+-- Fits lean acceleration = tip * aim + drift over every tick of the test.
+local function testNozzleAxis(axis)
+  local function aimAxis(v) if axis == "x" then aimNozzle(v, 0) else aimNozzle(0, v) end end
+  local sw, sa, sx, sz, saa, sax, saz = 0, 0, 0, 0, 0, 0, 0
+  local last, prevRate, prevAim = now(), { x = upRate.x, z = upRate.z }, actualAim(axis)
+  local function sample()
     waitFix()
+    local t = now()
+    local dt = t - last
+    if dt <= 0 then return end
+    local accX, accZ = (upRate.x - prevRate.x) / dt, (upRate.z - prevRate.z) / dt
+    -- upRate is smoothed, so it trails the nozzle by about a tick.
+    local a = prevAim
+    sw, sa, sx, sz = sw + dt, sa + a * dt, sx + accX * dt, sz + accZ * dt
+    saa, sax, saz = saa + a * a * dt, sax + a * accX * dt, saz + a * accZ * dt
+    last, prevRate, prevAim = t, { x = upRate.x, z = upRate.z }, actualAim(axis)
   end
-  aimNozzle(0, 0)
-  local dt = now() - t0
-  while now() - t0 < dt + 0.3 do waitFix() end  -- nozzle swinging back
-  local span = now() - t0
-  return (upRate.x - r0.x - driftX * span) / (dt * aim), (upRate.z - r0.z - driftZ * span) / (dt * aim)
+  local function turned(r0)
+    return math.sqrt((upRate.x - r0.x) ^ 2 + (upRate.z - r0.z) ^ 2)
+  end
+
+  aimAxis(0)
+  local t0 = now()
+  while now() - t0 < 0.3 do sample() end
+  local r0 = { x = upRate.x, z = upRate.z }
+  -- 1: push until it's turning at 0.12 rad/s (raising the aim if it's slow)
+  local aim, t1, stepT = 1 / 15, now(), now()
+  aimAxis(aim)
+  while turned(r0) < 0.12 and now() - t1 < 2.5 do
+    sample()
+    if now() - stepT > 0.4 and turned(r0) < 0.03 and aim < 1 then
+      aim, stepT = math.min(1, aim * 2), now()
+      aimAxis(aim)
+    end
+  end
+  local d = { x = upRate.x - r0.x, z = upRate.z - r0.z }
+  local push = now() - t1
+  -- 2: push back until the turning has stopped
+  aimAxis(-aim)
+  local t2 = now()
+  while (upRate.x - r0.x) * d.x + (upRate.z - r0.z) * d.z > 0 and now() - t2 < push * 2 + 0.5 do
+    sample()
+  end
+  -- 3: center and let the nozzle swing back
+  aimAxis(0)
+  local t3 = now()
+  while now() - t3 < 0.5 do sample() end
+
+  local den = saa - sa * sa / sw
+  if den <= 0 then return 0, 0, 0 end
+  local tx = (sax - sa * sx / sw) / den
+  local tz = (saz - sa * sz / sw) / den
+  return tx, tz, aim
 end
 
--- Tests each nozzle axis + then - (the second pulse undoes the first). Both
--- should point the same way per unit of aim; if they don't, it tries a
--- bigger aim, and if they still disagree it doesn't trust the nozzle.
+-- Tests both nozzle axes. A good fit tips the craft at roughly right angles
+-- for the two axes; if they come out nearly parallel the test didn't work.
 local nozzleNote = nil
+local calibratingNozzle = false
 local function calibrateNozzle()
-  nozzleTried = true
+  calibratingNozzle = true
   local tips = {}
   for _, axis in ipairs({ "x", "y" }) do
     status = "Calibrating vector thruster " .. axis
-    tips[axis] = { x = 0, z = 0 }
-    for _, size in ipairs({ 0.25, 0.5 }) do
-      local px, pz = pulseNozzle(axis, size)
-      local nx, nz = pulseNozzle(axis, -size)
-      local agree = (px * nx + pz * nz)
-        / (math.sqrt(px * px + pz * pz) * math.sqrt(nx * nx + nz * nz) + 1e-12)
-      log("nozzle %s aim %.2f: +(%.3f, %.3f) -(%.3f, %.3f) agree %.2f", axis, size, px, pz, nx, nz, agree)
-      if agree > 0.5 then
-        tips[axis] = { x = (px + nx) / 2, z = (pz + nz) / 2 }
-        break
-      end
-    end
+    local tx, tz, aim = testNozzleAxis(axis)
+    tips[axis] = { x = tx, z = tz }
+    log("nozzle %s: tip (%.3f, %.3f) per unit aim, tested at aim %.2f", axis, tx, tz, aim)
   end
+  calibratingNozzle = false
+  nozzleTried = true
+  local lx = math.sqrt(tips.x.x ^ 2 + tips.x.z ^ 2)
+  local ly = math.sqrt(tips.y.x ^ 2 + tips.y.z ^ 2)
+  local cross = math.abs(tips.x.x * tips.y.z - tips.x.z * tips.y.x) / (lx * ly + 1e-12)
+  log("nozzle axes %.0f deg apart", math.deg(math.asin(math.min(1, cross))))
+  if cross < 0.5 then tips.x = { x = 0, z = 0 } end
   local function strong(t) return t.x * t.x + t.z * t.z > 0.003 * 0.003 end
   if strong(tips.x) and strong(tips.y) then
     nozzleStrength = math.min(math.sqrt(tips.x.x ^ 2 + tips.x.z ^ 2), math.sqrt(tips.y.x ^ 2 + tips.y.z ^ 2))
@@ -362,7 +417,7 @@ local function calibrateNozzle()
     }
     log("nozzle leveling on, strength %.3f", nozzleStrength)
   else
-    nozzleNote = "its tests gave mixed results"
+    nozzleNote = "its test didn't give a clear result"
     log("nozzle leveling OFF: %s", nozzleNote)
   end
 end
@@ -389,7 +444,8 @@ local function altitudeLoop()
     local speedErr = wantVy - vel.y
     -- The nozzle needs the lift running to level the craft, so with one
     -- it only cuts out when upside down.
-    local cutoff = nozzleTip and 0 or math.cos(math.rad(MAX_TILT))
+    local nozzleOn = nozzle and orient and (nozzleTip or calibratingNozzle or not nozzleTried)
+    local cutoff = nozzleOn and 0 or math.cos(math.rad(MAX_TILT))
     if up.y < cutoff then
       -- Tipped over: the lift would only push sideways or down.
       setThrust(LIFT_SIDE, 0)
